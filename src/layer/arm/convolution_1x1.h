@@ -29,6 +29,7 @@ static void conv1x1s1_sgemm_transform_kernel_neon(const Mat& _kernel, Mat& kerne
 
     int p = 0;
 #if __ARM_NEON && __aarch64__
+    // 8 个 kernel 的第一个、8 个 kernel 的第二个、。。、9 ~ 16 kernel 的第一个、。。。
     for (; p+7<outch; p+=8)
     {
         const float* kernel0 = kernel + (p+0)*inch;
@@ -133,6 +134,7 @@ static void conv1x1s1_sgemm_neon(const Mat& bottom_blob, Mat& top_blob, const Ma
         int nn_size = size >> 3;
         int remain_size_start = nn_size << 3;
 
+        // 每个 channel 取 8 个元素，所有 channels 的 8 个元素排列在一起，再继续循环取下 8 个元素
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int ii=0; ii<nn_size; ii++)
         {
@@ -280,9 +282,9 @@ static void conv1x1s1_sgemm_neon(const Mat& bottom_blob, Mat& top_blob, const Ma
 
             asm volatile(
                 "ld1    {v0.4s, v1.4s}, [%20]   \n"
-                "dup    v16.4s, v0.s[0]         \n"
-                "dup    v17.4s, v0.s[0]         \n"
-                "dup    v18.4s, v0.s[1]         \n"
+                "dup    v16.4s, v0.s[0]         \n"     // v16 - top_blob 的第一个 channel 的前 4 个元素
+                "dup    v17.4s, v0.s[0]         \n"     // v17 - top_blob 的第一个 channel 的第 4~8 个元素
+                "dup    v18.4s, v0.s[1]         \n"     // v18 - top_blob 的第二个 channel 的前 4 个元素
                 "dup    v19.4s, v0.s[1]         \n"
                 "dup    v20.4s, v0.s[2]         \n"
                 "dup    v21.4s, v0.s[2]         \n"
@@ -305,22 +307,22 @@ static void conv1x1s1_sgemm_neon(const Mat& bottom_blob, Mat& top_blob, const Ma
                 "0:                             \n"
 
                 "prfm   pldl1keep, [%8, #512]   \n"
-                "ld1    {v8.4s, v9.4s, v10.4s, v11.4s}, [%8], #64   \n"
+                "ld1    {v8.4s, v9.4s, v10.4s, v11.4s}, [%8], #64   \n"     // v8 - bottom 的第一个 channel 的前 4 个元素， v9 - bottom 的第一个 channel 的第 5~8 个元素，v10 - bottom 的第二个 channel 的前 4 个元素，v11 - bottom 的第二个 channel 的第 5~8 个元素
 
                 "prfm   pldl1keep, [%9, #512]   \n"
-                "ld1    {v0.4s, v1.4s, v2.4s, v3.4s}, [%9], #64     \n"
+                "ld1    {v0.4s, v1.4s, v2.4s, v3.4s}, [%9], #64     \n"     // v0 - 前 4 个 kernel 的第一个元素，v1 - 第 5~8 个 kernel 的第一个元素，v2 - 前 4 个 kernel 的第二个元素，v3 - 第 5~8 个 kernel 的第二个元素，详见 conv1x1s1_sgemm_transform_kernel_neon 中的注释
 
-                "fmla   v16.4s, v8.4s, v0.s[0]  \n"
-                "fmla   v18.4s, v8.4s, v0.s[1]  \n"
+                "fmla   v16.4s, v8.4s, v0.s[0]  \n"     // 第一个 channel 的前 4 个元素，和第一个 kernel 的第一个元素乘并累加
+                "fmla   v18.4s, v8.4s, v0.s[1]  \n"     // 第一个 channel 的前 4 个元素，和第二个 kernel 的第一个元素乘并累加
                 "fmla   v20.4s, v8.4s, v0.s[2]  \n"
                 "fmla   v22.4s, v8.4s, v0.s[3]  \n"
 
-                "fmla   v17.4s, v9.4s, v0.s[0]  \n"
+                "fmla   v17.4s, v9.4s, v0.s[0]  \n"     // 第一个 channel 的第 5~8 个元素，和第一个 kernel 的第一个元素乘并累加
                 "fmla   v19.4s, v9.4s, v0.s[1]  \n"
                 "fmla   v21.4s, v9.4s, v0.s[2]  \n"
                 "fmla   v23.4s, v9.4s, v0.s[3]  \n"
 
-                "fmla   v24.4s, v8.4s, v1.s[0]  \n"
+                "fmla   v24.4s, v8.4s, v1.s[0]  \n"     // 第一个 channel 的前 4 个元素，和第五个 kernel 的第一个元素乘并累加
                 "fmla   v26.4s, v8.4s, v1.s[1]  \n"
                 "fmla   v28.4s, v8.4s, v1.s[2]  \n"
                 "fmla   v30.4s, v8.4s, v1.s[3]  \n"
@@ -331,9 +333,9 @@ static void conv1x1s1_sgemm_neon(const Mat& bottom_blob, Mat& top_blob, const Ma
                 "fmla   v31.4s, v9.4s, v1.s[3]  \n"
 
                 "prfm   pldl1keep, [%8, #512]   \n"
-                "ld1    {v12.4s, v13.4s, v14.4s, v15.4s}, [%8], #64 \n"
+                "ld1    {v12.4s, v13.4s, v14.4s, v15.4s}, [%8], #64 \n"     // 如 310 行，读取第三、四个 channel 的前 8 个元素
 
-                "fmla   v16.4s, v10.4s, v2.s[0] \n"
+                "fmla   v16.4s, v10.4s, v2.s[0] \n"     // 第二个 channel 的前 4 个元素和第一个 kernel 的第二个元素乘并累加
                 "fmla   v18.4s, v10.4s, v2.s[1] \n"
                 "fmla   v20.4s, v10.4s, v2.s[2] \n"
                 "fmla   v22.4s, v10.4s, v2.s[3] \n"
@@ -2184,25 +2186,25 @@ static void conv1x1s1_neon(const Mat& bottom_blob, Mat& top_blob, const Mat& _ke
             {
             asm volatile(
                 "prfm   pldl1keep, [%9, #128]       \n"
-                "ld1    {v17.4s}, [%9], #16         \n"
+                "ld1    {v17.4s}, [%9], #16         \n"         // img0(bottom channel 0) 的 4 个元素
 
                 "prfm   pldl1keep, [%1, #128]       \n"
-                "ld1    {v18.4s}, [%1]              \n"
+                "ld1    {v18.4s}, [%1]              \n"         // top channel 0 的 4 个元素
 
                 "prfm   pldl1keep, [%2, #128]       \n"
-                "ld1    {v19.4s}, [%2]              \n"
+                "ld1    {v19.4s}, [%2]              \n"         // top channel 1 的 4 个元素
 
                 "0:                                 \n"
 
-                "fmla   v18.4s, v17.4s, %34.s[0]    \n"
+                "fmla   v18.4s, v17.4s, %34.s[0]    \n"         // %34 -- kernel0
 
                 "prfm   pldl1keep, [%3, #128]       \n"
-                "ld1    {v20.4s}, [%3]              \n"
+                "ld1    {v20.4s}, [%3]              \n"         // top channel 2 的 4 个元素
 
                 "fmla   v19.4s, v17.4s, %35.s[0]    \n"
 
                 "prfm   pldl1keep, [%4, #128]       \n"
-                "ld1    {v21.4s}, [%4]              \n"
+                "ld1    {v21.4s}, [%4]              \n"         // top channel 3 的 4 个元素
 
                 "fmla   v20.4s, v17.4s, %36.s[0]    \n"
 
