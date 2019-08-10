@@ -1081,6 +1081,11 @@ void Net::set_vulkan_device(const VulkanDevice* _vkdev)
     vkdev = _vkdev;
 }
 
+const VulkanDevice* Net::vulkan_device() const
+{
+    return vkdev;
+}
+
 int Net::upload_model()
 {
     ncnn::VkTransfer cmd(vkdev);
@@ -1442,7 +1447,7 @@ int Net::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector
                     Mat bottom_blob_cpu_fp16;
                     if (opt.use_fp16_storage && vkdev->info.type == 0)
                     {
-                        ncnn::cast_float32_to_float16(bottom_blob_cpu, bottom_blob_cpu_fp16, opt.blob_allocator, opt.num_threads);
+                        ncnn::cast_float32_to_float16(bottom_blob_cpu, bottom_blob_cpu_fp16, opt);
                     }
                     else
                     {
@@ -1555,7 +1560,7 @@ int Net::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector
                         Mat bottom_blob_cpu_fp16;
                         if (opt.use_fp16_storage && vkdev->info.type == 0)
                         {
-                            ncnn::cast_float32_to_float16(bottom_blob_cpu, bottom_blob_cpu_fp16, opt.blob_allocator, opt.num_threads);
+                            ncnn::cast_float32_to_float16(bottom_blob_cpu, bottom_blob_cpu_fp16, opt);
                         }
                         else
                         {
@@ -1744,7 +1749,7 @@ int Net::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector
                     Mat& bottom_blob_cpu = blob_mats[bottom_blob_index];
                     if (opt.use_fp16_storage && vkdev->info.type == 0)
                     {
-                        ncnn::cast_float16_to_float32(bottom_blob_cpu_fp16, bottom_blob_cpu, opt.blob_allocator, opt.num_threads);
+                        ncnn::cast_float16_to_float32(bottom_blob_cpu_fp16, bottom_blob_cpu, opt);
                     }
                     else
                     {
@@ -1905,7 +1910,7 @@ int Net::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector
                     Mat& bottom_blob_cpu = blob_mats[bottom_blob_index];
                     if (opt.use_fp16_storage && vkdev->info.type == 0)
                     {
-                        ncnn::cast_float16_to_float32(bottom_blob_cpu_fp16, bottom_blob_cpu, opt.blob_allocator, opt.num_threads);
+                        ncnn::cast_float16_to_float32(bottom_blob_cpu_fp16, bottom_blob_cpu, opt);
                     }
                     else
                     {
@@ -2165,7 +2170,7 @@ int Extractor::extract(int blob_index, Mat& feat)
                 Mat& feat_cpu = blob_mats[blob_index];
                 if (opt.use_fp16_storage && net->vkdev->info.type == 0)
                 {
-                    ncnn::cast_float16_to_float32(feat_cpu_fp16, feat_cpu, opt.blob_allocator, opt.num_threads);
+                    ncnn::cast_float16_to_float32(feat_cpu_fp16, feat_cpu, opt);
                 }
                 else
                 {

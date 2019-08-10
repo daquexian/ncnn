@@ -129,6 +129,32 @@ static onnx::TensorProto get_node_attr_tensor(const onnx::NodeProto& node, const
     return onnx::TensorProto();
 }
 
+static std::vector<int> get_tensor_proto_reshape_shape(const onnx::TensorProto& tp)
+{
+    const int64_t* shape_data = 0;
+    int size = 0;
+
+    // int64
+    if (tp.has_raw_data())
+    {
+        shape_data = (const int64_t*)tp.raw_data().data();
+        size = tp.raw_data().size() / 8;
+    }
+    else if (tp.data_type() == 7)
+    {
+        shape_data = tp.int64_data().data();
+        size = tp.int64_data_size();
+    }
+
+    std::vector<int> shape;
+    for (int j=0; j<size; j++)
+    {
+        shape.push_back(shape_data[j]);
+    }
+
+    return shape;
+}
+
 static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
 {
     if (tp.has_raw_data())
@@ -423,6 +449,86 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             reduced_node_count += 1;
             i += 1;
         }
+
+        // ShuffleChannel <= Reshape - Transpose - Reshape
+        if (node->op_type() == "Reshape")
+        {
+            if (node_reference[node->output(0)] != 1)
+                continue;
+
+            std::vector<int> shape;
+            if (node->input_size() == 1)
+            {
+                shape = get_node_attr_ai(*node, "shape");
+            }
+            else
+            {
+                shape = get_tensor_proto_reshape_shape(weights[node->input(1)]);
+            }
+
+            // 1 groups channels_per_group, height, width
+            if (shape.size() != 5)
+                continue;
+
+            if (shape[0] != 1)
+                continue;
+
+            if (i+2 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+
+            if (node2->op_type() != "Transpose" || node3->op_type() != "Reshape")
+                continue;
+
+            if (node_reference[node2->output(0)] != 1)
+                continue;
+
+            // 0 2 1 3 4
+            std::vector<int> perm = get_node_attr_ai(*node2, "perm");
+            if (perm.size() != 5)
+                continue;
+
+            if (perm[0] != 0 || perm[1] != 2 || perm[2] != 1 || perm[3] != 3 || perm[4] != 4)
+                continue;
+
+            std::vector<int> shape3;
+            if (node3->input_size() == 1)
+            {
+                shape3 = get_node_attr_ai(*node3, "shape");
+            }
+            else
+            {
+                shape3 = get_tensor_proto_reshape_shape(weights[node3->input(1)]);
+            }
+
+            // 1, -1, height, width
+            if (shape3.size() != 4)
+                continue;
+
+            if (shape3[0] != 1 || shape3[1] != -1)
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+
+            node3->set_op_type("ShuffleChannel");
+            node3->set_input(0, node->input(0));
+
+            onnx::AttributeProto* attr_group = node3->add_attribute();
+            attr_group->set_name("group");
+            attr_group->set_i(shape[1]);
+
+            reduced_node_count += 2;
+            i += 2;
+        }
     }
 
     // remove node_reference entry with reference equals to one
@@ -495,7 +601,9 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 
         const onnx::TensorProto& M = binaryop_weights[input_name];
 
-        if (M.dims_size() == 1) {
+        if (M.dims_size() == 0) {
+            fprintf(pp, " 0=%d", get_tensor_proto_data_size(M));
+        } if (M.dims_size() == 1) {
             fprintf(pp, " 0=%d", (int)M.dims(0));
         } else if (M.dims_size() == 2) {
             fprintf(pp, " 0=%d", (int)M.dims(1));
@@ -752,6 +860,10 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
             fprintf(pp, "%-16s", "Reshape");
         }
+        else if (op == "ShuffleChannel")
+        {
+            fprintf(pp, "%-16s", "ShuffleChannel");
+        }
         else if (op == "Sigmoid")
         {
             fprintf(pp, "%-16s", "Sigmoid");
@@ -781,6 +893,10 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             fprintf(pp, "%-16s", "Eltwise");
         }
         else if (op == "Tan")
+        {
+            fprintf(pp, "%-16s", "UnaryOp");
+        }
+        else if (op == "Tanh")
         {
             fprintf(pp, "%-16s", "UnaryOp");
         }
@@ -1358,13 +1474,35 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
             else if (mode == "reflect")
             {
-                // FIXME
+                type = 2;
             }
 
-            int top = pads[0];
-            int bottom = pads[2];
-            int left = pads[1];
-            int right = pads[3];
+            int pad_size = pads.size();
+            int top, bottom, left, right;
+            if (pad_size == 8)
+            {
+                //NCHW
+                top = pads[2];
+                bottom = pads[6];
+                left = pads[3];
+                right = pads[7];
+            }
+            else if (pad_size == 6)
+            {
+                //CHW
+                top = pads[1];
+                bottom = pads[4];
+                left = pads[2];
+                right = pads[5];
+            }
+            else
+            {
+                //HW
+                top = pads[0];
+                bottom = pads[2];
+                left = pads[1];
+                right = pads[3];
+            }
 
             fprintf(pp, " 0=%d", top);
             fprintf(pp, " 1=%d", bottom);
@@ -1403,12 +1541,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
             else
             {
-                const onnx::TensorProto& shape_tp = weights[node.input(1)];
-                const int64_t* shape_data = shape_tp.int64_data().data();
-                for (int j=0; j<shape_tp.int64_data_size(); j++)
-                {
-                    shape.push_back(shape_data[j]);
-                }
+                shape = get_tensor_proto_reshape_shape(weights[node.input(1)]);
             }
 
             if (shape.size() == 1) {
@@ -1427,6 +1560,11 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 fprintf(pp, " 1=%d", shape[2]);
                 fprintf(pp, " 2=%d", shape[1]);
             }
+        }
+        else if (op == "ShuffleChannel")
+        {
+            int group = get_node_attr_i(node, "group", 1);
+            fprintf(pp, " 0=%d", group);
         }
         else if (op == "Sigmoid")
         {
@@ -1458,26 +1596,36 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int outh = -233;
             int outc = -233;
 
-            if (starts.size() == 2)
+            if (starts.size() == 1) 
+            {
+                woffset = starts[0];
+                hoffset = -233;
+                coffset = -233;
+                outw = ends[0] == -1 ? -233: ends[0] - starts[0]; // for onnx from pytorch, -233 works
+            } 
+            else if (starts.size() == 2)
             {
                 woffset = starts[1];
-                outw = ends[1] == -1 ? -234 : ends[1] - starts[1];
+                hoffset = -233;
+                coffset = -233;
+                outw = ends[1] == -1 ? -233 : ends[1] - starts[1];
             }
             else if (starts.size() == 3)
             {
                 woffset = starts[2];
                 hoffset = starts[1];
-                outw = ends[2] == -1 ? -234 : ends[2] - starts[2];
-                outh = ends[1] == -1 ? -234 : ends[1] - starts[1];
+                coffset = -233;
+                outw = ends[2] == -1 ? -233 : ends[2] - starts[2];
+                outh = ends[1] == -1 ? -233 : ends[1] - starts[1];
             }
             else if (starts.size() == 4)
             {
                 woffset = starts[3];
                 hoffset = starts[2];
                 coffset = starts[1];
-                outw = ends[3] == -1 ? -234 : ends[3] - starts[3];
-                outh = ends[2] == -1 ? -234 : ends[2] - starts[2];
-                outc = ends[1] == -1 ? -234 : ends[1] - starts[1];
+                outw = ends[3] == -1 ? -233 : ends[3] - starts[3];
+                outh = ends[2] == -1 ? -233 : ends[2] - starts[2];
+                outc = ends[1] == -1 ? -233 : ends[1] - starts[1];
             }
 
             fprintf(pp, " 0=%d", woffset);
@@ -1511,6 +1659,11 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         else if (op == "Tan")
         {
             int op_type = 11;
+            fprintf(pp, " 0=%d", op_type);
+        }
+        else if (op == "Tanh")
+        {
+            int op_type = 16;
             fprintf(pp, " 0=%d", op_type);
         }
         else if (op == "Transpose")
