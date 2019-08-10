@@ -12,6 +12,8 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#include "onnx2ncnn.h"
+
 #include <float.h>
 #include <stdio.h>
 #include <limits.h>
@@ -22,34 +24,10 @@
 #include <set>
 #include <limits>
 #include <algorithm>
+#include <vector>
 
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/io/zero_copy_stream_impl.h>
-#include <google/protobuf/text_format.h>
-#include <google/protobuf/message.h>
-
-#include "onnx.pb.h"
-
-static bool read_proto_from_binary(const char* filepath, google::protobuf::Message* message)
-{
-    std::ifstream fs(filepath, std::ifstream::in | std::ifstream::binary);
-    if (!fs.is_open())
-    {
-        fprintf(stderr, "open failed %s\n", filepath);
-        return false;
-    }
-
-    google::protobuf::io::IstreamInputStream input(&fs);
-    google::protobuf::io::CodedInputStream codedstr(&input);
-
-    codedstr.SetTotalBytesLimit(INT_MAX, INT_MAX / 2);
-
-    bool success = message->ParseFromCodedStream(&codedstr);
-
-    fs.close();
-
-    return success;
-}
+#include <onnx/onnx_pb.h>
+#include <wmc_utils.h>
 
 static std::vector<int> get_node_attr_ai(const onnx::NodeProto& node, const char* key)
 {
@@ -167,39 +145,39 @@ static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
     return 0;
 }
 
-static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, FILE* bp)
+static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, std::vector<char> &bp)
 {
     int size = get_tensor_proto_data_size(tp);
 
     if (tp.has_raw_data())
     {
         const std::string& raw_data = tp.raw_data();
-        fwrite(raw_data.data(), sizeof(float), size, bp);
+        for (const auto &x : raw_data) {
+            bp.push_back(x);
+        }
     }
     else if (tp.data_type() == 1)
     {
-        fwrite(tp.float_data().data(), sizeof(float), size, bp);
+        const auto *data = reinterpret_cast<const char *>(tp.float_data().data());
+        for (size_t i = 0; i < sizeof(float) * size; i++) {
+            bp.push_back(data[i]);
+        }
     }
 }
 
-int main(int argc, char** argv)
+tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 {
-    const char* onnxpb = argv[1];
-    const char* ncnn_prototxt = argc >= 4 ? argv[2] : "ncnn.param";
-    const char* ncnn_modelbin = argc >= 4 ? argv[3] : "ncnn.bin";
+    std::vector<char> pp;
+    std::vector<char> bp;
 
     onnx::ModelProto model;
+    bool s1 = model.ParseFromString(model_str);
 
     // load
-    bool s1 = read_proto_from_binary(onnxpb, &model);
     if (!s1)
     {
-        fprintf(stderr, "read_proto_from_binary failed\n");
-        return -1;
+        return tl::make_unexpected( "read_proto_from_binary failed");
     }
-
-    FILE* pp = fopen(ncnn_prototxt, "wb");
-    FILE* bp = fopen(ncnn_modelbin, "wb");
 
     // magic
     fprintf(pp, "7767517\n");
@@ -816,9 +794,7 @@ int main(int argc, char** argv)
         }
         else
         {
-            // TODO
-            fprintf(stderr, "%s not supported yet!\n", op.c_str());
-            fprintf(pp, "%-16s", op.c_str());
+            return tl::make_unexpected(op + " not supported yet!");
         }
 
         fprintf(pp, " %-24s %d %d", name.c_str(), input_size, output_size);
@@ -1208,7 +1184,7 @@ int main(int argc, char** argv)
             int axis = get_node_attr_i(node, "axis", 1);
             if (axis != 1)
             {
-                fprintf(stderr, "Unsupported Flatten axis %d!\n", axis);
+                return tl::make_unexpected( "Unsupported Flatten axis " + std::to_string(axis) + "!");
             }
         }
         else if (op == "Floor")
@@ -1469,8 +1445,10 @@ int main(int argc, char** argv)
             // assert step == 1
             for (int i=0; i<(int)steps.size(); i++)
             {
-                if (steps[i] != 1)
-                    fprintf(stderr, "Unsupported slice step !\n");
+                if (steps[i] != 1) {
+                    tl::make_unexpected("Unsupported slice step !");
+
+                }
             }
 
             int woffset = 0;
@@ -1566,7 +1544,7 @@ int main(int argc, char** argv)
                 else if (perm[1] == 3 && perm[2] == 4 && perm[3] == 2 && perm[4] == 1)
                     fprintf(pp, " 0=5");// c h wx
                 else
-                    fprintf(stderr, "Unsupported transpose type !\n");
+                    return tl::make_unexpected( "Unsupported transpose type !");
             }
         }
         else if (op == "Upsample" || op == "Resize")
@@ -1607,7 +1585,7 @@ int main(int argc, char** argv)
             }
             else if (mode == "trilinear")
             {
-                fprintf(stderr, "Unsupported Upsample/Resize mode !\n");
+                return tl::make_unexpected("Unsupported Upsample/Resize mode !");
             }
 
             float h_scale = 1.f;
@@ -1627,11 +1605,11 @@ int main(int argc, char** argv)
                 w_scale = scales[3];
 
                 if (scales[1] != 1.f)
-                    fprintf(stderr, "Unsupported Upsample/Resize scales !\n");
+                    return tl::make_unexpected("Unsupported Upsample/Resize scales !");
             }
             else
             {
-                fprintf(stderr, "Unsupported Upsample/Resize scales !\n");
+                return tl::make_unexpected("Unsupported Upsample/Resize scales !");
             }
 
             fprintf(pp, " 0=%d", resize_type);
@@ -1691,8 +1669,6 @@ int main(int argc, char** argv)
         }
     }
 
-    fclose(pp);
-    fclose(bp);
-
-    return 0;
+    return std::make_pair(pp, bp);
 }
+
