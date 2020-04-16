@@ -12,10 +12,16 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_DEPRECATE
+#endif
+
+#include <algorithm>
 #include <set>
 #include <vector>
 
 // ncnn public header
+#include "datareader.h"
 #include "net.h"
 #include "layer.h"
 
@@ -35,17 +41,23 @@
 #include "layer/eltwise.h"
 #include "layer/elu.h"
 #include "layer/exp.h"
+#include "layer/expanddims.h"
 #include "layer/flatten.h"
+#include "layer/hardsigmoid.h"
+#include "layer/hardswish.h"
 #include "layer/innerproduct.h"
 #include "layer/input.h"
 #include "layer/instancenorm.h"
 #include "layer/interp.h"
 #include "layer/log.h"
 #include "layer/lrn.h"
+#include "layer/lstm.h"
+#include "layer/memorydata.h"
 #include "layer/mvn.h"
 #include "layer/normalize.h"
 #include "layer/padding.h"
 #include "layer/permute.h"
+#include "layer/pixelshuffle.h"
 #include "layer/pooling.h"
 #include "layer/power.h"
 #include "layer/prelu.h"
@@ -64,6 +76,7 @@
 #include "layer/slice.h"
 #include "layer/shufflechannel.h"
 #include "layer/softmax.h"
+#include "layer/squeeze.h"
 #include "layer/threshold.h"
 #include "layer/unaryop.h"
 #include "layer/yolodetectionoutput.h"
@@ -82,6 +95,13 @@
 #define CLR         "\033[0m"
 
 #endif // defined(__aarch64__) && defined(LINUX)
+
+class DataReaderFromEmpty : public ncnn::DataReader
+{
+public:
+    virtual int scan(const char* format, void* p) const { return 0; }
+    virtual size_t read(void* /*buf*/, size_t size) const { return size; }
+};
 
 class NetOptimize : public ncnn::Net
 {
@@ -104,11 +124,18 @@ public:
     int fuse_innerproduct_activation();
 
     int eliminate_dropout();
+    int eliminate_pooling1x1();
+    int eliminate_noop();
+    int eliminate_orphaned_memorydata();
     int eliminate_flatten_after_global_pooling();
+    int eliminate_reshape_after_global_pooling();
     int eliminate_flatten_after_innerproduct();
+    int eliminate_reshape_before_binaryop();
 
     int replace_convolution_with_innerproduct_after_global_pooling();
     int replace_convolution_with_innerproduct_after_innerproduct();
+
+    int shape_inference();
 
 public:
     int fprintf_param_int_array(int id, const ncnn::Mat& m, FILE* pp);
@@ -148,7 +175,7 @@ void NetOptimize::find_fastest_fp32_conv(const char* dataname, int w, int h, int
     // embeded system generally use single thread
     opt.num_threads = 1;
 
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     ncnn::Extractor ex = create_extractor();
     
     ncnn::Mat input(w, h, c);
@@ -299,7 +326,7 @@ int NetOptimize::support_fp32_conv_type(const ncnn::Convolution* op, const ncnn:
 
 int NetOptimize::fuse_batchnorm_scale()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "BatchNorm")
@@ -360,7 +387,7 @@ int NetOptimize::fuse_batchnorm_scale()
 
 int NetOptimize::fuse_convolution_batchnorm()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Convolution")
@@ -403,7 +430,7 @@ int NetOptimize::fuse_convolution_batchnorm()
             std::vector<float> b(channels);
             for (int i=0; i<channels; i++)
             {
-                float sqrt_var = sqrt(batchnorm->var_data[i] + eps);
+                float sqrt_var = static_cast<float>(sqrt(batchnorm->var_data[i] + eps));
                 a[i] = batchnorm->bias_data[i] - batchnorm->slope_data[i] * batchnorm->mean_data[i] / sqrt_var;
                 b[i] = batchnorm->slope_data[i] / sqrt_var;
             }
@@ -428,7 +455,7 @@ int NetOptimize::fuse_convolution_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -443,7 +470,7 @@ int NetOptimize::fuse_convolution_batchnorm()
 
 int NetOptimize::fuse_convolutiondepthwise_batchnorm()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "ConvolutionDepthWise")
@@ -486,7 +513,7 @@ int NetOptimize::fuse_convolutiondepthwise_batchnorm()
             std::vector<float> b(channels);
             for (int i=0; i<channels; i++)
             {
-                float sqrt_var = sqrt(batchnorm->var_data[i] + eps);
+                float sqrt_var = static_cast<float>(sqrt(batchnorm->var_data[i] + eps));
                 a[i] = batchnorm->bias_data[i] - batchnorm->slope_data[i] * batchnorm->mean_data[i] / sqrt_var;
                 b[i] = batchnorm->slope_data[i] / sqrt_var;
             }
@@ -511,7 +538,7 @@ int NetOptimize::fuse_convolutiondepthwise_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -526,7 +553,7 @@ int NetOptimize::fuse_convolutiondepthwise_batchnorm()
 
 int NetOptimize::fuse_deconvolution_batchnorm()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Deconvolution")
@@ -569,7 +596,7 @@ int NetOptimize::fuse_deconvolution_batchnorm()
             std::vector<float> b(channels);
             for (int i=0; i<channels; i++)
             {
-                float sqrt_var = sqrt(batchnorm->var_data[i] + eps);
+                float sqrt_var = static_cast<float>(sqrt(batchnorm->var_data[i] + eps));
                 a[i] = batchnorm->bias_data[i] - batchnorm->slope_data[i] * batchnorm->mean_data[i] / sqrt_var;
                 b[i] = batchnorm->slope_data[i] / sqrt_var;
             }
@@ -594,7 +621,7 @@ int NetOptimize::fuse_deconvolution_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -609,7 +636,7 @@ int NetOptimize::fuse_deconvolution_batchnorm()
 
 int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "DeconvolutionDepthWise")
@@ -652,7 +679,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
             std::vector<float> b(channels);
             for (int i=0; i<channels; i++)
             {
-                float sqrt_var = sqrt(batchnorm->var_data[i] + eps);
+                float sqrt_var = static_cast<float>(sqrt(batchnorm->var_data[i] + eps));
                 a[i] = batchnorm->bias_data[i] - batchnorm->slope_data[i] * batchnorm->mean_data[i] / sqrt_var;
                 b[i] = batchnorm->slope_data[i] / sqrt_var;
             }
@@ -677,7 +704,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -692,7 +719,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
 
 int NetOptimize::fuse_innerproduct_batchnorm()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
@@ -735,7 +762,7 @@ int NetOptimize::fuse_innerproduct_batchnorm()
             std::vector<float> b(channels);
             for (int i=0; i<channels; i++)
             {
-                float sqrt_var = sqrt(batchnorm->var_data[i] + eps);
+                float sqrt_var = static_cast<float>(sqrt(batchnorm->var_data[i] + eps));
                 a[i] = batchnorm->bias_data[i] - batchnorm->slope_data[i] * batchnorm->mean_data[i] / sqrt_var;
                 b[i] = batchnorm->slope_data[i] / sqrt_var;
             }
@@ -760,7 +787,7 @@ int NetOptimize::fuse_innerproduct_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -775,7 +802,7 @@ int NetOptimize::fuse_innerproduct_batchnorm()
 
 int NetOptimize::fuse_innerproduct_dropout()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
@@ -843,7 +870,7 @@ int NetOptimize::fuse_innerproduct_dropout()
 
 int NetOptimize::fuse_convolution_activation()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Convolution")
@@ -914,7 +941,7 @@ int NetOptimize::fuse_convolution_activation()
 
 int NetOptimize::fuse_convolutiondepthwise_activation()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "ConvolutionDepthWise")
@@ -985,7 +1012,7 @@ int NetOptimize::fuse_convolutiondepthwise_activation()
 
 int NetOptimize::fuse_deconvolution_activation()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Deconvolution")
@@ -1056,7 +1083,7 @@ int NetOptimize::fuse_deconvolution_activation()
 
 int NetOptimize::fuse_deconvolutiondepthwise_activation()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "DeconvolutionDepthWise")
@@ -1127,7 +1154,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_activation()
 
 int NetOptimize::fuse_innerproduct_activation()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
@@ -1198,7 +1225,7 @@ int NetOptimize::fuse_innerproduct_activation()
 
 int NetOptimize::eliminate_dropout()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Dropout")
@@ -1240,9 +1267,217 @@ int NetOptimize::eliminate_dropout()
     return 0;
 }
 
+int NetOptimize::eliminate_pooling1x1()
+{
+    const size_t layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "Pooling")
+            continue;
+
+        ncnn::Pooling* pooling = (ncnn::Pooling*)layers[i];
+        if (pooling->pad_left != 0 || pooling->pad_right != 0 || pooling->pad_top != 0 || pooling->pad_bottom != 0)
+            continue;
+
+        if (pooling->kernel_w != 1 || pooling->kernel_h != 1 || pooling->stride_w != 1 || pooling->stride_h != 1)
+            continue;
+
+        if (pooling->global_pooling != 0)
+            continue;
+
+        // Any - Pooling
+        int bottom_blob_index = layers[i]->bottoms[0];
+
+        int top_i = -1;
+        int j = i - 1;
+        for (; j>=0; j--)
+        {
+            if (layers[j]->type == "ncnnfused")
+                continue;
+
+            for (int k=0; k<layers[j]->tops.size(); k++)
+            {
+                if (layers[j]->tops[k] == bottom_blob_index)
+                {
+                    top_i = k;
+                    break;
+                }
+            }
+
+            if (top_i != -1)
+                break;
+        }
+
+        if (j == -1)
+            continue;
+
+        ncnn::Layer* any = layers[j];
+
+        fprintf(stderr, "eliminate_pooling1x1 %s %s\n", any->name.c_str(), pooling->name.c_str());
+
+        int top_blob_index_final = pooling->tops[0];
+        any->tops[top_i] = top_blob_index_final;
+        blobs[top_blob_index_final].producer = j;
+        pooling->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
+int NetOptimize::eliminate_noop()
+{
+    const size_t layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "Noop")
+            continue;
+
+        ncnn::Layer* noop = layers[i];
+
+        if (noop->bottoms.empty())
+        {
+            // Noop
+            fprintf(stderr, "eliminate_noop %s\n", noop->name.c_str());
+
+            size_t top_blob_count = noop->tops.size();
+            for (int k=0; k<top_blob_count; k++)
+            {
+                int top_blob_index_final = noop->tops[k];
+                blobs[top_blob_index_final].producer = -1;
+            }
+            noop->type = "ncnnfused";
+
+            continue;
+        }
+
+        // Any - Noop
+        int bottom_blob_index = layers[i]->bottoms[0];
+
+        int j = i - 1;
+        for (; j>=0; j--)
+        {
+            if (layers[j]->type == "ncnnfused")
+                continue;
+
+            if (layers[j]->tops.size() != 1)
+                continue;
+
+            if (layers[j]->tops[0] == bottom_blob_index)
+                break;
+        }
+
+        if (j == -1)
+            continue;
+
+        ncnn::Layer* any = layers[j];
+
+        fprintf(stderr, "eliminate_noop %s %s\n", any->name.c_str(), noop->name.c_str());
+
+        size_t top_blob_count = std::min(noop->tops.size(), any->tops.size());
+        for (int k=0; k<top_blob_count; k++)
+        {
+            int top_blob_index_final = noop->tops[k];
+            any->tops[k] = top_blob_index_final;
+            blobs[top_blob_index_final].producer = j;
+        }
+        noop->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
+int NetOptimize::eliminate_orphaned_memorydata()
+{
+    const size_t layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "MemoryData")
+            continue;
+
+        // MemoryData - X
+        int top_blob_index = layers[i]->tops[0];
+
+        int j = i + 1;
+        for (; j<layer_count; j++)
+        {
+            if (layers[j]->type == "ncnnfused")
+                continue;
+
+            bool orphaned = true;
+            for (int k=0; k<layers[j]->bottoms.size(); k++)
+            {
+                if (layers[j]->bottoms[k] == top_blob_index)
+                {
+                    orphaned = false;
+                    break;
+                }
+            }
+
+            if (!orphaned)
+                break;
+        }
+
+        if (j < layer_count)
+            continue;
+
+        // assert orphaned == true
+        fprintf(stderr, "eliminate_orphaned_memorydata %s\n", layers[i]->name.c_str());
+
+        layers[i]->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
+int NetOptimize::eliminate_reshape_after_global_pooling()
+{
+    const size_t layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "Pooling")
+            continue;
+
+        ncnn::Pooling* pooling = (ncnn::Pooling*)layers[i];
+        if (pooling->global_pooling == 0)
+            continue;
+
+        // Pooling - Reshape
+        int top_blob_index = layers[i]->tops[0];
+
+        int j = i + 1;
+        for (; j<layer_count; j++)
+        {
+            if (layers[j]->type != "Reshape")
+                continue;
+
+            if (layers[j]->bottoms.size() != 1)
+                continue;
+
+            if (layers[j]->bottoms[0] == top_blob_index)
+                break;
+        }
+
+        if (j == layer_count)
+            continue;
+
+        ncnn::Reshape* reshape = (ncnn::Reshape*)layers[j];
+        if (reshape->h != -233 || reshape->c != -233 || reshape->permute != 0)
+            continue;
+
+        fprintf(stderr, "eliminate_reshape_after_global_pooling %s %s\n", pooling->name.c_str(), reshape->name.c_str());
+
+        int top_blob_index_final = reshape->tops[0];
+        pooling->tops[0] = top_blob_index_final;
+        blobs[top_blob_index_final].producer = i;
+        reshape->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
 int NetOptimize::eliminate_flatten_after_global_pooling()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Pooling")
@@ -1286,7 +1521,7 @@ int NetOptimize::eliminate_flatten_after_global_pooling()
 
 int NetOptimize::eliminate_flatten_after_innerproduct()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
@@ -1325,9 +1560,57 @@ int NetOptimize::eliminate_flatten_after_innerproduct()
     return 0;
 }
 
+int NetOptimize::eliminate_reshape_before_binaryop()
+{
+    const size_t layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "Reshape")
+            continue;
+
+        ncnn::Reshape* reshape = (ncnn::Reshape*)layers[i];
+        if (reshape->w != 1 || reshape->h != 1 || reshape->permute != 0)
+            continue;
+
+        // Reshape - BinaryOp
+        int top_blob_index = layers[i]->tops[0];
+
+        int j = i + 1;
+        for (; j<layer_count; j++)
+        {
+            if (layers[j]->type != "BinaryOp")
+                continue;
+
+            if (layers[j]->bottoms.size() != 2)
+                continue;
+
+            if (layers[j]->bottoms[0] == top_blob_index || layers[j]->bottoms[1] == top_blob_index)
+                break;
+        }
+
+        if (j == layer_count)
+            continue;
+
+        ncnn::BinaryOp* binaryop = (ncnn::BinaryOp*)layers[j];
+
+        fprintf(stderr, "eliminate_reshape_before_binaryop %s %s\n", reshape->name.c_str(), binaryop->name.c_str());
+
+        int bottom_blob_index_final = reshape->bottoms[0];
+        if (layers[j]->bottoms[0] == top_blob_index)
+            binaryop->bottoms[0] = bottom_blob_index_final;
+        if (layers[j]->bottoms[1] == top_blob_index)
+            binaryop->bottoms[1] = bottom_blob_index_final;
+        blobs[bottom_blob_index_final].consumers.erase(std::find(blobs[bottom_blob_index_final].consumers.begin(), blobs[bottom_blob_index_final].consumers.end(), i));
+        blobs[bottom_blob_index_final].consumers.push_back(j);
+        reshape->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
 int NetOptimize::replace_convolution_with_innerproduct_after_global_pooling()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (int i=0; i<layer_count; i++)
     {
         if (layers[i]->type != "Pooling")
@@ -1373,9 +1656,12 @@ int NetOptimize::replace_convolution_with_innerproduct_after_global_pooling()
         innerproduct->num_output = convolution->num_output;
         innerproduct->bias_term = convolution->bias_term;
         innerproduct->weight_data_size = convolution->weight_data_size;
+        innerproduct->int8_scale_term = convolution->int8_scale_term;
 
         innerproduct->weight_data = convolution->weight_data;
         innerproduct->bias_data = convolution->bias_data;
+        innerproduct->weight_data_int8_scales = convolution->weight_data_int8_scales;
+        innerproduct->bottom_blob_int8_scale = convolution->bottom_blob_int8_scale;
 
         innerproduct->activation_type = convolution->activation_type;
         innerproduct->activation_params = convolution->activation_params;
@@ -1389,7 +1675,7 @@ int NetOptimize::replace_convolution_with_innerproduct_after_global_pooling()
 
 int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
 {
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
     for (;;)
     {
     bool replaced = false;
@@ -1436,9 +1722,12 @@ int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
         innerproduct2->num_output = convolution->num_output;
         innerproduct2->bias_term = convolution->bias_term;
         innerproduct2->weight_data_size = convolution->weight_data_size;
+        innerproduct->int8_scale_term = convolution->int8_scale_term;
 
         innerproduct2->weight_data = convolution->weight_data;
         innerproduct2->bias_data = convolution->bias_data;
+        innerproduct->weight_data_int8_scales = convolution->weight_data_int8_scales;
+        innerproduct->bottom_blob_int8_scale = convolution->bottom_blob_int8_scale;
 
         innerproduct2->activation_type = convolution->activation_type;
         innerproduct2->activation_params = convolution->activation_params;
@@ -1451,6 +1740,119 @@ int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
 
     if (!replaced)
         break;
+    }
+
+    return 0;
+}
+
+int NetOptimize::shape_inference()
+{
+    const size_t layer_count = layers.size();
+    const size_t blob_count = blobs.size();
+
+    ncnn::Extractor ex = create_extractor();
+
+    // prepare Input blobs
+    for (size_t i=0; i<layer_count; i++)
+    {
+        const ncnn::Layer* layer = layers[i];
+        if (layer->type == "ncnnfused")
+            continue;
+
+        if (layer->type != "Input")
+            continue;
+
+        ncnn::Input* input = (ncnn::Input*)layer;
+
+        int w = input->w;
+        int h = input->h;
+        int c = input->c;
+
+        int dims = 0;
+        if (w == 0 && h == 0 && c == 0) dims = 0;
+        if (w != 0 && h == 0 && c == 0) dims = 1;
+        if (w != 0 && h != 0 && c == 0) dims = 2;
+        if (w != 0 && h != 0 && c != 0) dims = 3;
+
+        if (dims == 0)
+        {
+            fprintf(stderr, "Input layer %s without shape info, shape_inference aborted\n", layer->name.c_str());
+            return -1;
+        }
+
+        ncnn::Mat m;
+        if (dims == 1) m.create(w);
+        if (dims == 2) m.create(w, h);
+        if (dims == 3) m.create(w, h, c);
+
+        ex.input(layer->tops[0], m);
+    }
+
+    // prepare blobs with predefined shape
+    for (size_t i=0; i<blob_count; i++)
+    {
+        const ncnn::Blob blob = blobs[i];
+
+        int dims = blob.shape.dims;
+        int w = blob.shape.w;
+        int h = blob.shape.h;
+        int c = blob.shape.c;
+
+        if (dims == 0)
+            continue;
+
+        ncnn::Mat m;
+        if (dims == 1) m.create(w);
+        if (dims == 2) m.create(w, h);
+        if (dims == 3) m.create(w, h, c);
+
+        ex.input(int(i), m);
+    }
+
+    fprintf(stderr, "shape_inference\n");
+
+    // resolve all layer output blob shape
+    for (size_t i=0; i<layer_count; i++)
+    {
+        const ncnn::Layer* layer = layers[i];
+        if (layer->type == "ncnnfused")
+            continue;
+
+        for (size_t j=0; j<layer->tops.size(); j++)
+        {
+            int top_blob_index = layer->tops[j];
+
+            ncnn::Mat m;
+            ex.extract(top_blob_index, m);
+
+            blobs[top_blob_index].shape = m;
+        }
+    }
+
+    // assign all layer blob shape
+    for (size_t i=0; i<layer_count; i++)
+    {
+        ncnn::Layer* layer = layers[i];
+        if (layer->type == "ncnnfused")
+            continue;
+
+        layer->bottom_shapes.resize(layer->bottoms.size());
+        for (size_t j=0; j<layer->bottoms.size(); j++)
+        {
+            int bottom_blob_index = layer->bottoms[j];
+
+            layer->bottom_shapes[j] = blobs[bottom_blob_index].shape;
+        }
+
+        layer->top_shapes.resize(layer->tops.size());
+        for (size_t j=0; j<layer->tops.size(); j++)
+        {
+            int top_blob_index = layer->tops[j];
+
+            layer->top_shapes[j] = blobs[top_blob_index].shape;
+
+//             fprintf(stderr, "%d %4d %4d %4d | %2d %s\n", blobs[top_blob_index].shape.dims, blobs[top_blob_index].shape.w, blobs[top_blob_index].shape.h, blobs[top_blob_index].shape.c, top_blob_index, blobs[top_blob_index].name.c_str());
+        }
     }
 
     return 0;
@@ -1478,7 +1880,7 @@ int NetOptimize::fprintf_param_float_array(int id, const ncnn::Mat& m, FILE* pp)
     fprintf(pp, " -%d=%d", 23300 + id, count);
     for (int i=0; i<count; i++)
     {
-        fprintf(pp, ",%f", ptr[i]);
+        fprintf(pp, ",%e", ptr[i]);
     }
 
     return 0;
@@ -1510,7 +1912,7 @@ int NetOptimize::fwrite_weight_tag_data(int tag, const ncnn::Mat& data, FILE* bp
 
     // padding to 32bit align
     int nwrite = ftell(bp) - p0;
-    int nalign = alignSize(nwrite, 4);
+    size_t nalign = alignSize(nwrite, 4);
     unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
     fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
 
@@ -1526,7 +1928,7 @@ int NetOptimize::fwrite_weight_data(const ncnn::Mat& data, FILE* bp)
 
     // padding to 32bit align
     int nwrite = ftell(bp) - p0;
-    int nalign = alignSize(nwrite, 4);
+    size_t nalign = alignSize(nwrite, 4);
     unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
     fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
 
@@ -1540,7 +1942,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
     fprintf(pp, "7767517\n");
 
-    const int layer_count = layers.size();
+    const size_t layer_count = layers.size();
 
     int layer_count_fused = 0;
     std::set<std::string> blob_names;
@@ -1552,14 +1954,14 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
         layer_count_fused++;
 
-        int bottom_count = layer->bottoms.size();
+        size_t bottom_count = layer->bottoms.size();
         for (int j=0; j<bottom_count; j++)
         {
             int bottom_blob_index = layer->bottoms[j];
             blob_names.insert(blobs[bottom_blob_index].name);
         }
 
-        int top_count = layer->tops.size();
+        size_t top_count = layer->tops.size();
         for (int j=0; j<top_count; j++)
         {
             int top_blob_index = layer->tops[j];
@@ -1567,9 +1969,9 @@ int NetOptimize::save(const char* parampath, const char* binpath)
         }
     }
 
-    int blob_count_fused = blob_names.size();
+    size_t blob_count_fused = blob_names.size();
 
-    fprintf(pp, "%d %d\n", layer_count_fused, blob_count_fused);
+    fprintf(pp, "%d %zd\n", layer_count_fused, blob_count_fused);
 
     for (int i=0; i<layer_count; i++)
     {
@@ -1577,10 +1979,10 @@ int NetOptimize::save(const char* parampath, const char* binpath)
         if (layer->type == "ncnnfused")
             continue;
 
-        int bottom_count = layer->bottoms.size();
-        int top_count = layer->tops.size();
+        size_t bottom_count = layer->bottoms.size();
+        size_t top_count = layer->tops.size();
 
-        fprintf(pp, "%-24s %-24s %d %d", layer->type.c_str(), layer->name.c_str(), bottom_count, top_count);
+        fprintf(pp, "%-24s %-24s %zd %zd", layer->type.c_str(), layer->name.c_str(), bottom_count, top_count);
 
         for (int j=0; j<bottom_count; j++)
         {
@@ -1591,6 +1993,35 @@ int NetOptimize::save(const char* parampath, const char* binpath)
         {
             int top_blob_index = layer->tops[j];
             fprintf(pp, " %s", blobs[top_blob_index].name.c_str());
+        }
+
+        // write shape hints
+        bool shape_ready = true;
+        for (int j=0; j<top_count; j++)
+        {
+            int top_blob_index = layer->tops[j];
+
+            int dims = blobs[top_blob_index].shape.dims;
+            if (dims == 0)
+            {
+                shape_ready = false;
+                break;
+            }
+        }
+        if (shape_ready)
+        {
+            fprintf(pp, " -23330=%zd", top_count * 4);
+            for (int j=0; j<top_count; j++)
+            {
+                int top_blob_index = layer->tops[j];
+
+                int dims = blobs[top_blob_index].shape.dims;
+                int w = blobs[top_blob_index].shape.w;
+                int h = blobs[top_blob_index].shape.h;
+                int c = blobs[top_blob_index].shape.c;
+
+                fprintf(pp, ",%d,%d,%d,%d", dims, w, h, c);
+            }
         }
 
         ncnn::Layer* layer_default = ncnn::create_layer(layer->typeindex);
@@ -1607,7 +2038,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::BatchNorm* op_default = (ncnn::BatchNorm*)layer_default;
 
             fprintf_param_value(" 0=%d", channels)
-            fprintf_param_value(" 1=%f", eps)
+            fprintf_param_value(" 1=%e", eps)
 
             fwrite_weight_data(op->slope_data, bp);
             fwrite_weight_data(op->mean_data, bp);
@@ -1630,15 +2061,15 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", op_type)
             fprintf_param_value(" 1=%d", with_scalar)
-            fprintf_param_value(" 2=%f", b)
+            fprintf_param_value(" 2=%e", b)
         }
         else if (layer->type == "Clip")
         {
             ncnn::Clip* op = (ncnn::Clip*)layer;
             ncnn::Clip* op_default = (ncnn::Clip*)layer_default;
 
-            fprintf_param_value(" 0=%f", min)
-            fprintf_param_value(" 1=%f", max)
+            fprintf_param_value(" 0=%e", min)
+            fprintf_param_value(" 1=%e", max)
         }
         else if (layer->type == "Concat")
         {
@@ -1659,14 +2090,17 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             { if (op->dilation_h != op->dilation_w) fprintf(pp, " 12=%d", op->dilation_h); }
             fprintf_param_value(" 3=%d", stride_w)
             { if (op->stride_h != op->stride_w) fprintf(pp, " 13=%d", op->stride_h); }
-            fprintf_param_value(" 4=%d", pad_w)
-            { if (op->pad_h != op->pad_w) fprintf(pp, " 14=%d", op->pad_h); }
+            fprintf_param_value(" 4=%d", pad_left)
+            { if (op->pad_top != op->pad_left) fprintf(pp, " 14=%d", op->pad_top); }
+            { if (op->pad_right != op->pad_left) fprintf(pp, " 15=%d", op->pad_right); }
+            { if (op->pad_bottom != op->pad_top) fprintf(pp, " 16=%d", op->pad_bottom); }
+            fprintf_param_value(" 18=%e", pad_value)
             fprintf_param_value(" 5=%d", bias_term)
             fprintf_param_value(" 6=%d", weight_data_size)
             fprintf_param_value(" 8=%d", int8_scale_term)
             fprintf_param_value(" 9=%d", activation_type)
             { if (!op->activation_params.empty()) fprintf_param_float_array(10, op->activation_params, pp); }
-            fprintf_param_value(" 15=%d", impl_type)
+            fprintf_param_value(" 17=%d", impl_type)
 
             fwrite_weight_tag_data(0, op->weight_data, bp);
             fwrite_weight_data(op->bias_data, bp);
@@ -1683,8 +2117,11 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             { if (op->dilation_h != op->dilation_w) fprintf(pp, " 12=%d", op->dilation_h); }
             fprintf_param_value(" 3=%d", stride_w)
             { if (op->stride_h != op->stride_w) fprintf(pp, " 13=%d", op->stride_h); }
-            fprintf_param_value(" 4=%d", pad_w)
-            { if (op->pad_h != op->pad_w) fprintf(pp, " 14=%d", op->pad_h); }
+            fprintf_param_value(" 4=%d", pad_left)
+            { if (op->pad_top != op->pad_left) fprintf(pp, " 14=%d", op->pad_top); }
+            { if (op->pad_right != op->pad_left) fprintf(pp, " 15=%d", op->pad_right); }
+            { if (op->pad_bottom != op->pad_top) fprintf(pp, " 16=%d", op->pad_bottom); }
+            fprintf_param_value(" 18=%e", pad_value)
             fprintf_param_value(" 5=%d", bias_term)
             fprintf_param_value(" 6=%d", weight_data_size)
             fprintf_param_value(" 7=%d", group)
@@ -1706,6 +2143,12 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 3=%d", outw)
             fprintf_param_value(" 4=%d", outh)
             fprintf_param_value(" 5=%d", outc)
+            fprintf_param_value(" 6=%d", woffset2)
+            fprintf_param_value(" 7=%d", hoffset2)
+            fprintf_param_value(" 8=%d", coffset2)
+            { if (!op->starts.empty()) fprintf_param_int_array(9, op->starts, pp); }
+            { if (!op->ends.empty()) fprintf_param_int_array(10, op->ends, pp); }
+            { if (!op->axes.empty()) fprintf_param_int_array(11, op->axes, pp); }
         }
         else if (layer->type == "Deconvolution")
         {
@@ -1719,8 +2162,14 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             { if (op->dilation_h != op->dilation_w) fprintf(pp, " 12=%d", op->dilation_h); }
             fprintf_param_value(" 3=%d", stride_w)
             { if (op->stride_h != op->stride_w) fprintf(pp, " 13=%d", op->stride_h); }
-            fprintf_param_value(" 4=%d", pad_w)
-            { if (op->pad_h != op->pad_w) fprintf(pp, " 14=%d", op->pad_h); }
+            fprintf_param_value(" 4=%d", pad_left)
+            { if (op->pad_top != op->pad_left) fprintf(pp, " 14=%d", op->pad_top); }
+            { if (op->pad_right != op->pad_left) fprintf(pp, " 15=%d", op->pad_right); }
+            { if (op->pad_bottom != op->pad_top) fprintf(pp, " 16=%d", op->pad_bottom); }
+            fprintf_param_value(" 18=%d", output_pad_right)
+            { if (op->output_pad_bottom != op->output_pad_right) fprintf(pp, " 19=%d", op->output_pad_bottom); }
+            fprintf_param_value(" 20=%d", output_w)
+            { if (op->output_h != op->output_w) fprintf(pp, " 21=%d", op->output_h); }
             fprintf_param_value(" 5=%d", bias_term)
             fprintf_param_value(" 6=%d", weight_data_size)
             fprintf_param_value(" 9=%d", activation_type)
@@ -1741,8 +2190,14 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             { if (op->dilation_h != op->dilation_w) fprintf(pp, " 12=%d", op->dilation_h); }
             fprintf_param_value(" 3=%d", stride_w)
             { if (op->stride_h != op->stride_w) fprintf(pp, " 13=%d", op->stride_h); }
-            fprintf_param_value(" 4=%d", pad_w)
-            { if (op->pad_h != op->pad_w) fprintf(pp, " 14=%d", op->pad_h); }
+            fprintf_param_value(" 4=%d", pad_left)
+            { if (op->pad_top != op->pad_left) fprintf(pp, " 14=%d", op->pad_top); }
+            { if (op->pad_right != op->pad_left) fprintf(pp, " 15=%d", op->pad_right); }
+            { if (op->pad_bottom != op->pad_top) fprintf(pp, " 16=%d", op->pad_bottom); }
+            fprintf_param_value(" 18=%d", output_pad_right)
+            { if (op->output_pad_bottom != op->output_pad_right) fprintf(pp, " 19=%d", op->output_pad_bottom); }
+            fprintf_param_value(" 20=%d", output_w)
+            { if (op->output_h != op->output_w) fprintf(pp, " 21=%d", op->output_h); }
             fprintf_param_value(" 5=%d", bias_term)
             fprintf_param_value(" 6=%d", weight_data_size)
             fprintf_param_value(" 7=%d", group)
@@ -1758,21 +2213,21 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::DetectionOutput* op_default = (ncnn::DetectionOutput*)layer_default;
 
             fprintf_param_value(" 0=%d", num_class)
-            fprintf_param_value(" 1=%f", nms_threshold)
+            fprintf_param_value(" 1=%e", nms_threshold)
             fprintf_param_value(" 2=%d", nms_top_k)
             fprintf_param_value(" 3=%d", keep_top_k)
-            fprintf_param_value(" 4=%f", confidence_threshold)
-            fprintf_param_value(" 5=%f", variances[0])
-            fprintf_param_value(" 6=%f", variances[1])
-            fprintf_param_value(" 7=%f", variances[2])
-            fprintf_param_value(" 8=%f", variances[3])
+            fprintf_param_value(" 4=%e", confidence_threshold)
+            fprintf_param_value(" 5=%e", variances[0])
+            fprintf_param_value(" 6=%e", variances[1])
+            fprintf_param_value(" 7=%e", variances[2])
+            fprintf_param_value(" 8=%e", variances[3])
         }
         else if (layer->type == "Dropout")
         {
             ncnn::Dropout* op = (ncnn::Dropout*)layer;
             ncnn::Dropout* op_default = (ncnn::Dropout*)layer_default;
 
-            fprintf_param_value(" 0=%f", scale)
+            fprintf_param_value(" 0=%e", scale)
         }
         else if (layer->type == "Eltwise")
         {
@@ -1787,16 +2242,42 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::ELU* op = (ncnn::ELU*)layer;
             ncnn::ELU* op_default = (ncnn::ELU*)layer_default;
 
-            fprintf_param_value(" 0=%f", alpha)
+            fprintf_param_value(" 0=%e", alpha)
         }
         else if (layer->type == "Exp")
         {
             ncnn::Exp* op = (ncnn::Exp*)layer;
             ncnn::Exp* op_default = (ncnn::Exp*)layer_default;
 
-            fprintf_param_value(" 0=%f", base)
-            fprintf_param_value(" 1=%f", scale)
-            fprintf_param_value(" 2=%f", shift)
+            fprintf_param_value(" 0=%e", base)
+            fprintf_param_value(" 1=%e", scale)
+            fprintf_param_value(" 2=%e", shift)
+        }
+        else if (layer->type == "ExpandDims")
+        {
+            ncnn::ExpandDims* op = (ncnn::ExpandDims*)layer;
+            ncnn::ExpandDims* op_default = (ncnn::ExpandDims*)layer_default;
+
+            fprintf_param_value(" 0=%d", expand_w)
+            fprintf_param_value(" 1=%d", expand_h)
+            fprintf_param_value(" 2=%d", expand_c)
+            { if (!op->axes.empty()) fprintf_param_int_array(0, op->axes, pp); }
+        }
+        else if (layer->type == "HardSigmoid")
+        {
+            ncnn::HardSigmoid* op = (ncnn::HardSigmoid*)layer;
+            ncnn::HardSigmoid* op_default = (ncnn::HardSigmoid*)layer_default;
+
+            fprintf_param_value(" 0=%e", alpha)
+            fprintf_param_value(" 1=%e", beta)
+        }
+        else if (layer->type == "HardSwish")
+        {
+            ncnn::HardSwish* op = (ncnn::HardSwish*)layer;
+            ncnn::HardSwish* op_default = (ncnn::HardSwish*)layer_default;
+
+            fprintf_param_value(" 0=%e", alpha)
+            fprintf_param_value(" 1=%e", beta)
         }
         else if (layer->type == "InnerProduct")
         {
@@ -1828,7 +2309,10 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::InstanceNorm* op_default = (ncnn::InstanceNorm*)layer_default;
 
             fprintf_param_value(" 0=%d", channels)
-            fprintf_param_value(" 1=%f", eps)
+            fprintf_param_value(" 1=%e", eps)
+
+            fwrite_weight_data(op->gamma_data, bp);
+            fwrite_weight_data(op->beta_data, bp);
         }
         else if (layer->type == "Interp")
         {
@@ -1836,8 +2320,8 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Interp* op_default = (ncnn::Interp*)layer_default;
 
             fprintf_param_value(" 0=%d", resize_type)
-            fprintf_param_value(" 1=%f", height_scale)
-            fprintf_param_value(" 2=%f", width_scale)
+            fprintf_param_value(" 1=%e", height_scale)
+            fprintf_param_value(" 2=%e", width_scale)
             fprintf_param_value(" 3=%d", output_height)
             fprintf_param_value(" 4=%d", output_width)
         }
@@ -1846,9 +2330,9 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Log* op = (ncnn::Log*)layer;
             ncnn::Log* op_default = (ncnn::Log*)layer_default;
 
-            fprintf_param_value(" 0=%f", base)
-            fprintf_param_value(" 1=%f", scale)
-            fprintf_param_value(" 2=%f", shift)
+            fprintf_param_value(" 0=%e", base)
+            fprintf_param_value(" 1=%e", scale)
+            fprintf_param_value(" 2=%e", shift)
         }
         else if (layer->type == "LRN")
         {
@@ -1857,9 +2341,32 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", region_type)
             fprintf_param_value(" 1=%d", local_size)
-            fprintf_param_value(" 2=%f", alpha)
-            fprintf_param_value(" 3=%f", beta)
-            fprintf_param_value(" 4=%f", bias)
+            fprintf_param_value(" 2=%e", alpha)
+            fprintf_param_value(" 3=%e", beta)
+            fprintf_param_value(" 4=%e", bias)
+        }
+        else if (layer->type == "LSTM")
+        {
+            ncnn::LSTM* op = (ncnn::LSTM*)layer;
+            ncnn::LSTM* op_default = (ncnn::LSTM*)layer_default;
+
+            fprintf_param_value(" 0=%d", num_output)
+            fprintf_param_value(" 1=%d", weight_data_size)
+            fprintf_param_value(" 2=%d", direction)
+
+            fwrite_weight_tag_data(0, op->weight_xc_data, bp);
+            fwrite_weight_tag_data(0, op->bias_c_data, bp);
+            fwrite_weight_tag_data(0, op->weight_hc_data, bp);
+        }
+        else if (layer->type == "MemoryData")
+        {
+            ncnn::MemoryData* op = (ncnn::MemoryData*)layer;
+            ncnn::MemoryData* op_default = (ncnn::MemoryData*)layer_default;
+
+            fprintf_param_value(" 0=%d", w)
+            fprintf_param_value(" 1=%d", h)
+            fprintf_param_value(" 2=%d", c)
+            fwrite_weight_data(op->data, bp);
         }
         else if (layer->type == "MVN")
         {
@@ -1868,7 +2375,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", normalize_variance)
             fprintf_param_value(" 1=%d", across_channels)
-            fprintf_param_value(" 2=%f", eps)
+            fprintf_param_value(" 2=%e", eps)
         }
         else if (layer->type == "Normalize")
         {
@@ -1877,9 +2384,10 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", across_spatial)
             fprintf_param_value(" 1=%d", channel_shared)
-            fprintf_param_value(" 2=%f", eps)
+            fprintf_param_value(" 2=%e", eps)
             fprintf_param_value(" 3=%d", scale_data_size)
             fprintf_param_value(" 4=%d", across_channel)
+            fprintf_param_value(" 9=%d", eps_mode)
 
             fwrite_weight_data(op->scale_data, bp);
         }
@@ -1893,7 +2401,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 2=%d", left)
             fprintf_param_value(" 3=%d", right)
             fprintf_param_value(" 4=%d", type)
-            fprintf_param_value(" 5=%f", value)
+            fprintf_param_value(" 5=%e", value)
         }
         else if (layer->type == "Permute")
         {
@@ -1901,6 +2409,13 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Permute* op_default = (ncnn::Permute*)layer_default;
 
             fprintf_param_value(" 0=%d", order_type)
+        }
+        else if (layer->type == "PixelShuffle")
+        {
+            ncnn::PixelShuffle* op = (ncnn::PixelShuffle*)layer;
+            ncnn::PixelShuffle* op_default = (ncnn::PixelShuffle*)layer_default;
+
+            fprintf_param_value(" 0=%d", upscale_factor)
         }
         else if (layer->type == "Pooling")
         {
@@ -1924,9 +2439,9 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Power* op = (ncnn::Power*)layer;
             ncnn::Power* op_default = (ncnn::Power*)layer_default;
 
-            fprintf_param_value(" 0=%f", power)
-            fprintf_param_value(" 1=%f", scale)
-            fprintf_param_value(" 2=%f", shift)
+            fprintf_param_value(" 0=%e", power)
+            fprintf_param_value(" 1=%e", scale)
+            fprintf_param_value(" 2=%e", shift)
         }
         else if (layer->type == "PReLU")
         {
@@ -1945,17 +2460,17 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             { if (!op->min_sizes.empty()) fprintf_param_float_array(0, op->min_sizes, pp); }
             { if (!op->max_sizes.empty()) fprintf_param_float_array(1, op->max_sizes, pp); }
             { if (!op->aspect_ratios.empty()) fprintf_param_float_array(2, op->aspect_ratios, pp); }
-            fprintf_param_value(" 3=%f", variances[0])
-            fprintf_param_value(" 4=%f", variances[1])
-            fprintf_param_value(" 5=%f", variances[2])
-            fprintf_param_value(" 6=%f", variances[3])
+            fprintf_param_value(" 3=%e", variances[0])
+            fprintf_param_value(" 4=%e", variances[1])
+            fprintf_param_value(" 5=%e", variances[2])
+            fprintf_param_value(" 6=%e", variances[3])
             fprintf_param_value(" 7=%d", flip)
             fprintf_param_value(" 8=%d", clip)
             fprintf_param_value(" 9=%d", image_width)
             fprintf_param_value(" 10=%d", image_height)
-            fprintf_param_value(" 11=%f", step_width)
-            fprintf_param_value(" 12=%f", step_height)
-            fprintf_param_value(" 13=%f", offset)
+            fprintf_param_value(" 11=%e", step_width)
+            fprintf_param_value(" 12=%e", step_height)
+            fprintf_param_value(" 13=%e", offset)
         }
         else if (layer->type == "Proposal")
         {
@@ -1966,7 +2481,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 1=%d", base_size)
             fprintf_param_value(" 2=%d", pre_nms_topN)
             fprintf_param_value(" 3=%d", after_nms_topN)
-            fprintf_param_value(" 4=%f", nms_thresh)
+            fprintf_param_value(" 4=%e", nms_thresh)
             fprintf_param_value(" 5=%d", min_size)
         }
         else if (layer->type == "PSROIPooling")
@@ -1976,7 +2491,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", pooled_width)
             fprintf_param_value(" 1=%d", pooled_height)
-            fprintf_param_value(" 2=%f", spatial_scale)
+            fprintf_param_value(" 2=%e", spatial_scale)
             fprintf_param_value(" 3=%d", output_dim)
         }
         else if (layer->type == "Quantize")
@@ -1984,7 +2499,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Quantize* op = (ncnn::Quantize*)layer;
             ncnn::Quantize* op_default = (ncnn::Quantize*)layer_default;
 
-            fprintf_param_value(" 0=%f", scale)
+            fprintf_param_value(" 0=%e", scale)
         }
         else if (layer->type == "Reduction")
         {
@@ -1992,15 +2507,17 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Reduction* op_default = (ncnn::Reduction*)layer_default;
 
             fprintf_param_value(" 0=%d", operation)
-            fprintf_param_value(" 1=%d", dim)
-            fprintf_param_value(" 2=%f", coeff)
+            fprintf_param_value(" 1=%d", reduce_all)
+            fprintf_param_value(" 2=%e", coeff)
+            { if (!op->axes.empty()) fprintf_param_int_array(3, op->axes, pp); }
+            fprintf_param_value(" 4=%d", keepdims)
         }
         else if (layer->type == "ReLU")
         {
             ncnn::ReLU* op = (ncnn::ReLU*)layer;
             ncnn::ReLU* op_default = (ncnn::ReLU*)layer_default;
 
-            fprintf_param_value(" 0=%f", slope)
+            fprintf_param_value(" 0=%e", slope)
         }
         else if (layer->type == "Reorg")
         {
@@ -2014,8 +2531,8 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             ncnn::Requantize* op = (ncnn::Requantize*)layer;
             ncnn::Requantize* op_default = (ncnn::Requantize*)layer_default;
 
-            fprintf_param_value(" 0=%f", scale_in)
-            fprintf_param_value(" 1=%f", scale_out)
+            fprintf_param_value(" 0=%e", scale_in)
+            fprintf_param_value(" 1=%e", scale_out)
             fprintf_param_value(" 2=%d", bias_term)
             fprintf_param_value(" 3=%d", bias_data_size)
             fprintf_param_value(" 4=%d", fusion_relu)
@@ -2037,7 +2554,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", pooled_width)
             fprintf_param_value(" 1=%d", pooled_height)
-            fprintf_param_value(" 2=%f", spatial_scale)
+            fprintf_param_value(" 2=%e", spatial_scale)
         }
         else if (layer->type == "ROIPooling")
         {
@@ -2046,7 +2563,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", pooled_width)
             fprintf_param_value(" 1=%d", pooled_height)
-            fprintf_param_value(" 2=%f", spatial_scale)
+            fprintf_param_value(" 2=%e", spatial_scale)
         }
         else if (layer->type == "Scale")
         {
@@ -2088,12 +2605,22 @@ int NetOptimize::save(const char* parampath, const char* binpath)
                 fprintf(pp, " 1=%d", fixbug0);
             }
         }
+        else if (layer->type == "Squeeze")
+        {
+            ncnn::Squeeze* op = (ncnn::Squeeze*)layer;
+            ncnn::Squeeze* op_default = (ncnn::Squeeze*)layer_default;
+
+            fprintf_param_value(" 0=%d", squeeze_w)
+            fprintf_param_value(" 1=%d", squeeze_h)
+            fprintf_param_value(" 2=%d", squeeze_c)
+            { if (!op->axes.empty()) fprintf_param_int_array(0, op->axes, pp); }
+        }
         else if (layer->type == "Threshold")
         {
             ncnn::Threshold* op = (ncnn::Threshold*)layer;
             ncnn::Threshold* op_default = (ncnn::Threshold*)layer_default;
 
-            fprintf_param_value(" 0=%f", threshold)
+            fprintf_param_value(" 0=%e", threshold)
         }
         else if (layer->type == "UnaryOp")
         {
@@ -2109,8 +2636,8 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", num_class)
             fprintf_param_value(" 1=%d", num_box)
-            fprintf_param_value(" 2=%f", confidence_threshold)
-            fprintf_param_value(" 3=%f", nms_threshold)
+            fprintf_param_value(" 2=%e", confidence_threshold)
+            fprintf_param_value(" 3=%e", nms_threshold)
             { if (!op->biases.empty()) fprintf_param_float_array(4, op->biases, pp); }
         }
         else if (layer->type == "Yolov3DetectionOutput")
@@ -2120,8 +2647,8 @@ int NetOptimize::save(const char* parampath, const char* binpath)
 
             fprintf_param_value(" 0=%d", num_class)
             fprintf_param_value(" 1=%d", num_box)
-            fprintf_param_value(" 2=%f", confidence_threshold)
-            fprintf_param_value(" 3=%f", nms_threshold)
+            fprintf_param_value(" 2=%e", confidence_threshold)
+            fprintf_param_value(" 3=%e", nms_threshold)
             { if (!op->biases.empty()) fprintf_param_float_array(4, op->biases, pp); }
             { if (!op->mask.empty()) fprintf_param_int_array(5, op->mask, pp); }
             { if (!op->anchors_scale.empty()) fprintf_param_float_array(6, op->anchors_scale, pp); }
@@ -2178,7 +2705,13 @@ int main(int argc, char** argv)
     }
 
     optimizer.load_param(inparam);
-    optimizer.load_model(inbin);
+    if (strcmp(inbin, "null") == 0)
+    {
+        DataReaderFromEmpty dr;
+        optimizer.load_model(dr);
+    }
+    else
+        optimizer.load_model(inbin);
 
 #if defined(__aarch64__) && defined(LINUX)
     optimizer.find_fastest_fp32_conv(dataname, inw, inh, inc);
@@ -2197,12 +2730,19 @@ int main(int argc, char** argv)
     optimizer.fuse_innerproduct_activation();
 
     optimizer.eliminate_dropout();
+    optimizer.eliminate_pooling1x1();
+    optimizer.eliminate_noop();
     optimizer.eliminate_flatten_after_global_pooling();
+    optimizer.eliminate_reshape_after_global_pooling();
+    optimizer.eliminate_reshape_before_binaryop();
 
     optimizer.replace_convolution_with_innerproduct_after_global_pooling();
     optimizer.replace_convolution_with_innerproduct_after_innerproduct();
 
     optimizer.eliminate_flatten_after_innerproduct();
+    optimizer.eliminate_orphaned_memorydata();
+
+    optimizer.shape_inference();
 
     optimizer.save(outparam, outbin);
 

@@ -3,12 +3,29 @@
 
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](https://raw.githubusercontent.com/Tencent/ncnn/master/LICENSE.txt) 
 [![Build Status](https://travis-ci.org/Tencent/ncnn.svg?branch=master)](https://travis-ci.org/Tencent/ncnn)
-[![Coverage Status](https://coveralls.io/repos/github/Tencent/ncnn/badge.svg?branch=master)](https://coveralls.io/github/Tencent/ncnn?branch=master)
-
+[![codecov](https://codecov.io/gh/Tencent/ncnn/branch/master/graph/badge.svg)](https://codecov.io/gh/Tencent/ncnn)
 
 ncnn is a high-performance neural network inference computing framework optimized for mobile platforms. ncnn is deeply considerate about deployment and uses on mobile phones from the beginning of design. ncnn does not have third party dependencies. it is cross-platform, and runs faster than all known open source frameworks on mobile phone cpu. Developers can easily deploy deep learning algorithm models to the mobile platform by using efficient ncnn implementation, create intelligent APPs, and bring the artificial intelligence to your fingertips. ncnn is currently being used in many Tencent applications, such as QQ, Qzone, WeChat, Pitu and so on.
 
 ncnn 是一个为手机端极致优化的高性能神经网络前向计算框架。ncnn 从设计之初深刻考虑手机端的部署和使用。无第三方依赖，跨平台，手机端 cpu 的速度快于目前所有已知的开源框架。基于 ncnn，开发者能够将深度学习算法轻松移植到手机端高效执行，开发出人工智能 APP，将 AI 带到你的指尖。ncnn 目前已在腾讯多款应用中使用，如 QQ，Qzone，微信，天天P图等。
+
+---
+
+### Current building status matrix
+
+| System | CPU (32bit) | CPU (64bit) | GPU (32bit) | GPU (64bit) |
+| :---: | :---: | :---: | :--: | :--: |
+| Linux (GCC) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/linux-x64-cpu-gcc)](https://github.com/Tencent/ncnn/actions?query=workflow%3Alinux-x64-cpu-gcc) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/linux-x64-gpu-gcc)](https://github.com/Tencent/ncnn/actions?query=workflow%3Alinux-x64-gpu-gcc) |
+| Linux (Clang) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/linux-x64-cpu-clang)](https://github.com/Tencent/ncnn/actions?query=workflow%3Alinux-x64-cpu-clang) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/linux-x64-gpu-clang)](https://github.com/Tencent/ncnn/actions?query=workflow%3Alinux-x64-gpu-clang) |
+| Linux (MIPS) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/linux-mips32-mti)](https://github.com/Tencent/ncnn/actions?query=workflow%3Alinux-mips32-mti) | — | — | — |
+| Windows (VS2017) | — | [![Build Status](https://badges.herokuapp.com/travis/Tencent/ncnn?env=NAME=windows-vs2017&label=build)](https://travis-ci.org/Tencent/ncnn) | — | [![Build Status](https://badges.herokuapp.com/travis/Tencent/ncnn?env=NAME=windows-vs2017-gpu&label=build)](https://travis-ci.org/Tencent/ncnn) |
+| Windows (VS2019) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/windows-x64-cpu-vs2019)](https://github.com/Tencent/ncnn/actions?query=workflow%3Awindows-x64-cpu-vs2019) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/windows-x64-gpu-vs2019)](https://github.com/Tencent/ncnn/actions?query=workflow%3Awindows-x64-gpu-vs2019) |
+| MacOS | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/macos-x64-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Amacos-x64-cpu) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/macos-x64-gpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Amacos-x64-gpu) |
+| Android | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-armv7-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-armv7-cpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-armv8-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-armv8-cpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-armv7-gpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-armv7-gpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-armv8-gpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-armv8-gpu) |
+| Android-x86 | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-x86-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-x86-cpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-x64-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-x64-cpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-x86-gpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-x86-gpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/android-x64-gpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aandroid-x64-gpu) |
+| iOS | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/ios-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aios-cpu) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/ios-cpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aios-cpu) | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/ios-64bit-gpu)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aios-64bit-gpu) |
+| iOS Simulator | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/ios-simulator)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aios-simulator) | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/ios-simulator)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aios-simulator) | — | — |
+| WebAssembly | — | [![Build Status](https://img.shields.io/github/workflow/status/Tencent/ncnn/web-assembly)](https://github.com/Tencent/ncnn/actions?query=workflow%3Aweb-assembly) | — | — |
 
 ---
 
@@ -17,12 +34,12 @@ ncnn 是一个为手机端极致优化的高性能神经网络前向计算框架
 
 * Classical CNN: VGG AlexNet GoogleNet Inception ...
 * Practical CNN: ResNet DenseNet SENet FPN ...
-* Light-weight CNN: SqueezeNet MobileNetV1/V2 ShuffleNetV1/V2 MNasNet ...
+* Light-weight CNN: SqueezeNet MobileNetV1/V2/V3 ShuffleNetV1/V2 MNasNet ...
 * Detection: MTCNN facedetection ...
 * Detection: VGG-SSD MobileNet-SSD SqueezeNet-SSD MobileNetV2-SSDLite ...
 * Detection: Faster-RCNN R-FCN ...
 * Detection: YOLOV2 YOLOV3 MobileNet-YOLOV3 ...
-* Segmentation: FCN PSPNet ...
+* Segmentation: FCN PSPNet UNet ...
 
 ---
 
@@ -43,9 +60,9 @@ ncnn 是一个为手机端极致优化的高性能神经网络前向计算框架
 
 **[download prebuild binary package for android and ios](https://github.com/Tencent/ncnn/releases)**
 
-**[how to use ncnn with alexnet](https://github.com/Tencent/ncnn/wiki/how-to-use-ncnn-with-alexnet) with detailed steps, recommended for beginners :)**
+**[use ncnn with alexnet](https://github.com/Tencent/ncnn/wiki/use-ncnn-with-alexnet) with detailed steps, recommended for beginners :)**
 
-**[ncnn 组件使用指北 alexnet](https://github.com/Tencent/ncnn/wiki/ncnn-%E7%BB%84%E4%BB%B6%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8C%97-alexnet) 附带详细步骤，新人强烈推荐 :)**
+**[ncnn 组件使用指北 alexnet](https://github.com/Tencent/ncnn/wiki/use-ncnn-with-alexnet.zh) 附带详细步骤，新人强烈推荐 :)**
 
 **[use netron for ncnn model visualization](https://lutzroeder.github.io/netron/)**
 
@@ -126,11 +143,13 @@ ncnn 是一个为手机端极致优化的高性能神经网络前向计算框架
 
 ### Example project
 
-* https://github.com/Tencent/ncnn/tree/master/examples/squeezencnn
+* https://github.com/nihui/ncnn-android-squeezenet
+* https://github.com/nihui/ncnn-android-styletransfer
 * https://github.com/chehongshu/ncnnforandroid_objectiondetection_Mobilenetssd
 * https://github.com/moli232777144/mtcnn_ncnn
 
 ![](https://github.com/nihui/ncnn-assets/raw/master/20181217/ncnn-2.jpg)
+![](https://github.com/nihui/ncnn-assets/raw/master/20181217/4.jpg)
 ![](https://github.com/nihui/ncnn-assets/raw/master/20181217/ncnn-23.jpg)
 ![](https://github.com/nihui/ncnn-assets/raw/master/20181217/ncnn-m.png)
 

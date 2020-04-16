@@ -29,6 +29,7 @@ public:
 
     virtual int upload_model(VkTransfer& cmd, const Option& opt);
 
+    using Scale::forward_inplace;
     virtual int forward_inplace(std::vector<VkMat>& bottom_top_blobs, VkCompute& cmd, const Option& opt) const;
     virtual int forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& opt) const;
 
@@ -36,10 +37,8 @@ public:
     VkMat scale_data_gpu;
     VkMat bias_data_gpu;
     Pipeline* pipeline_scale;
-
-    VkMat scale_data_gpu_pack4;
-    VkMat bias_data_gpu_pack4;
     Pipeline* pipeline_scale_pack4;
+    Pipeline* pipeline_scale_pack8;
 };
 
 } // namespace ncnn

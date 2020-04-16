@@ -27,11 +27,16 @@ public:
     virtual int create_pipeline(const Option& opt);
     virtual int destroy_pipeline(const Option& opt);
 
+    using Packing::forward;
     virtual int forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const;
 
 public:
     Pipeline* pipeline_packing_1to4;
     Pipeline* pipeline_packing_4to1;
+    Pipeline* pipeline_packing_1to8;
+    Pipeline* pipeline_packing_4to8;
+    Pipeline* pipeline_packing_8to4;
+    Pipeline* pipeline_packing_8to1;
 };
 
 } // namespace ncnn

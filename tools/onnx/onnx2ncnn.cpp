@@ -41,7 +41,7 @@ static std::vector<int> get_node_attr_ai(const onnx::NodeProto& node, const char
             v.resize(attr.ints_size());
             for (int j=0; j<attr.ints_size(); j++)
             {
-                v[j] = attr.ints(j);
+                v[j] = std::max(std::min(attr.ints(j), (::google::protobuf::int64)INT_MAX), (::google::protobuf::int64)INT_MIN);
             }
 
             break;
@@ -80,7 +80,7 @@ static int get_node_attr_i(const onnx::NodeProto& node, const char* key, int def
         const onnx::AttributeProto& attr = node.attribute(i);
         if (attr.name() == key)
         {
-            return attr.i();
+            return std::max(std::min(attr.i(), (::google::protobuf::int64)INT_MAX), (::google::protobuf::int64)INT_MIN);
         }
     }
 
@@ -129,7 +129,7 @@ static onnx::TensorProto get_node_attr_tensor(const onnx::NodeProto& node, const
     return onnx::TensorProto();
 }
 
-static std::vector<int> get_tensor_proto_reshape_shape(const onnx::TensorProto& tp)
+static std::vector<int> get_node_attr_from_input_ai(const onnx::TensorProto& tp)
 {
     const int64_t* shape_data = 0;
     int size = 0;
@@ -146,13 +146,13 @@ static std::vector<int> get_tensor_proto_reshape_shape(const onnx::TensorProto& 
         size = tp.int64_data_size();
     }
 
-    std::vector<int> shape;
+    std::vector<int> v(size);
     for (int j=0; j<size; j++)
     {
-        shape.push_back(shape_data[j]);
+        v[j] = shape_data[j];
     }
 
-    return shape;
+    return v;
 }
 
 static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
@@ -171,7 +171,7 @@ static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
     return 0;
 }
 
-static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, std::vector<char> &bp)
+static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, FILE* bp)
 {
     int size = get_tensor_proto_data_size(tp);
 
@@ -187,6 +187,899 @@ static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, std::vector<ch
         const auto *data = reinterpret_cast<const char *>(tp.float_data().data());
         for (size_t i = 0; i < sizeof(float) * size; i++) {
             bp.push_back(data[i]);
+        }
+    }
+}
+
+static void fuse_matmul(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // MatMul <= Transpose(weight) - MatMul
+        if (node->op_type() == "Transpose")
+        {
+            // check weight
+            if (weights.find(node->input(0)) == weights.end())
+                continue;
+
+            onnx::TensorProto& B = weights[node->input(0)];
+            if (B.dims_size() != 2)
+                continue;
+
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            // perm = (1, 0)
+            std::vector<int> perm = get_node_attr_ai(*node, "perm");
+            if (perm.size() != 2)
+                continue;
+            if (perm[0] != 1 || perm[1] != 0)
+                continue;
+
+            if (i+1 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+
+            if (node2->op_type() != "MatMul")
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            blob_names.erase(node->output(0));
+
+            node2->set_input(1, node->input(0));
+
+            // permute weight
+            {
+                const int h = B.dims(0);
+                const int w = B.dims(1);
+
+                std::vector<float> permuted_data;
+                permuted_data.reserve(h * w);
+                const float* bptr = B.has_raw_data() ? (const float*)B.raw_data().data() : B.float_data().data();
+
+                for (int j=0; j<w; j++)
+                {
+                    for (int k=0; k<h; k++)
+                    {
+                        float vb = bptr[ k*w + j ];
+                        permuted_data.push_back(vb);
+                    }
+                }
+
+                B.set_dims(0, w);
+                B.set_dims(1, h);
+
+                if (B.has_raw_data())
+                {
+                    B.set_raw_data(permuted_data.data(), permuted_data.size() * sizeof(float));
+                }
+                else
+                {
+                    for (int j=0; j<(int)permuted_data.size(); j++)
+                        B.set_float_data(j, permuted_data[j]);
+                }
+            }
+
+            reduced_node_count += 1;
+            i += 1;
+        }
+    }
+}
+
+static void fuse_shufflechannel(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // ShuffleChannel <= Reshape - Transpose - Reshape
+        // ShuffleChannel <= Reshape - Transpose - Constant - Reshape
+        if (node->op_type() == "Reshape")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            std::vector<int> shape;
+            if (node->input_size() == 1)
+            {
+                shape = get_node_attr_ai(*node, "shape");
+            }
+            else
+            {
+                // skip weight reshape
+                if (weights.find(node->input(1)) == weights.end())
+                    continue;
+
+                shape = get_node_attr_from_input_ai(weights[node->input(1)]);
+            }
+
+            // 1 groups channels_per_group, height, width
+            if (shape.size() != 5)
+                continue;
+
+            if (shape[0] != 1)
+                continue;
+
+            if (i+2 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+
+            if (node3->op_type() == "Constant")
+            {
+                if (i+3 >= node_count)
+                    continue;
+
+                node3 = mutable_graph->mutable_node(i+3);
+            }
+
+            if (node2->op_type() != "Transpose" || node3->op_type() != "Reshape")
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+            // 0 2 1 3 4
+            std::vector<int> perm = get_node_attr_ai(*node2, "perm");
+            if (perm.size() != 5)
+                continue;
+
+            if (perm[0] != 0 || perm[1] != 2 || perm[2] != 1 || perm[3] != 3 || perm[4] != 4)
+                continue;
+
+            std::vector<int> shape3;
+            if (node3->input_size() == 1)
+            {
+                shape3 = get_node_attr_ai(*node3, "shape");
+            }
+            else
+            {
+                // skip weight reshape
+                if (weights.find(node3->input(1)) == weights.end())
+                    continue;
+
+                shape3 = get_node_attr_from_input_ai(weights[node3->input(1)]);
+            }
+
+            // 1, -1, height, width
+            if (shape3.size() != 4)
+                continue;
+
+            if (shape3[0] != 1 || (shape3[1] != -1 && shape3[1] != shape[1] * shape[2]))
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+
+            node3->set_op_type("ShuffleChannel");
+            node3->set_input(0, node->input(0));
+
+            onnx::AttributeProto* attr_group = node3->add_attribute();
+            attr_group->set_name("group");
+            attr_group->set_i(shape[1]);
+
+            reduced_node_count += 2;
+            i += 2;
+        }
+    }
+}
+
+static void fuse_hardswish(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // HardSwish <= Add(+3) - Clip(0,6) - Mul(X,) - Div(/6)
+        // HardSwish <= Add(+3) - Clip(0,6) - Mul(X,) - Mul(*(1/6))
+        // HardSwish <= Add(+3) - Clip(0,6) - Mul(X,) - Constant - Div(/6)
+        // HardSwish <= Add(+3) - Clip(0,6) - Mul(X,) - Constant - Mul(*(1/6))
+        //     out = x * F.relu6(x + 3, inplace=True) / 6
+        if (node->op_type() == "Add")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            if (i+3 >= node_count)
+                continue;
+
+            if (binaryop_weights.find(node->input(1)) == binaryop_weights.end())
+                continue;
+
+            const onnx::TensorProto& add_three = binaryop_weights[node->input(1)];
+            if (add_three.dims_size() != 0 || get_tensor_proto_data_size(add_three) != 1)
+                continue;
+
+            float constant_add_three = add_three.has_raw_data() ? ((const float*)add_three.raw_data().data())[0] : add_three.float_data().data()[0];
+            if (constant_add_three != 3.f)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+            onnx::NodeProto* node4 = mutable_graph->mutable_node(i+3);
+
+            if (node4->op_type() == "Constant")
+            {
+                if (i+4 >= node_count)
+                    continue;
+
+                node4 = mutable_graph->mutable_node(i+4);
+            }
+
+            if (node2->op_type() != "Clip" || node3->op_type() != "Mul" || (node4->op_type() != "Div" && node4->op_type() != "Mul"))
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+            float relu6_min;
+            float relu6_max;
+            if (node2->input_size() == 1)
+            {
+                relu6_min = get_node_attr_f(*node2, "min", -FLT_MAX);
+                relu6_max = get_node_attr_f(*node2, "max", FLT_MAX);
+            }
+            else
+            {
+                const onnx::TensorProto& min_tp = weights[node2->input(1)];
+                const onnx::TensorProto& max_tp = weights[node2->input(2)];
+                const float* min_data = min_tp.has_raw_data() ? (const float*)min_tp.raw_data().data() : min_tp.float_data().data();
+                const float* max_data = max_tp.has_raw_data() ? (const float*)max_tp.raw_data().data() : max_tp.float_data().data();
+
+                relu6_min = min_data[0];
+                relu6_max = max_data[0];
+            }
+            if (relu6_min != 0.f || relu6_max != 6.f)
+                continue;
+
+            if (node_reference.find(node3->output(0)) == node_reference.end() || node_reference[node3->output(0)] != 1)
+                continue;
+
+            if (node3->input(0) != node->input(0) || node3->input(1) != node2->output(0))
+                continue;
+
+            if (binaryop_weights.find(node4->input(1)) == binaryop_weights.end())
+                continue;
+
+            const onnx::TensorProto& div_six = binaryop_weights[node4->input(1)];
+            if (div_six.dims_size() != 0 || get_tensor_proto_data_size(div_six) != 1)
+                continue;
+
+            float constant_div_six = div_six.has_raw_data() ? ((const float*)div_six.raw_data().data())[0] : div_six.float_data().data()[0];
+            if (node4->op_type() == "Div" && constant_div_six != 6.f)
+                continue;
+            if (node4->op_type() == "Mul" && constant_div_six != 1/6.f)
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+            node3->set_op_type("noop_reducedncnn");
+
+            node_reference[node->input(0)] -= 1;
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            node_reference.erase(node_reference.find(node3->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+            blob_names.erase(node3->output(0));
+
+            reduced_binaryop_weights.push_back(node->input(1));
+            reduced_binaryop_weights.push_back(node4->input(1));
+
+            node4->set_op_type("HardSwish");
+            node4->clear_input();
+            node4->add_input(node->input(0));
+
+            onnx::AttributeProto* attr_alpha = node4->add_attribute();
+            attr_alpha->set_name("alpha");
+            attr_alpha->set_f(1.f/6.f);
+
+            onnx::AttributeProto* attr_beta = node4->add_attribute();
+            attr_beta->set_name("beta");
+            attr_beta->set_f(3.f/6.f);
+
+            reduced_node_count += 3;
+            i += 3;
+        }
+    }
+
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // HardSwish <= HardSigmoid - Mul
+        //     out = x * hsigmoid(x)
+        if (node->op_type() == "HardSigmoid")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            float alpha = get_node_attr_f(*node, "alpha", 0.2f);
+            float beta = get_node_attr_f(*node, "beta", 0.5f);
+
+            if (i+1 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+
+            if (node2->op_type() != "Mul")
+                continue;
+
+            if (node2->input(0) != node->input(0) || node2->input(1) != node->output(0))
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+
+            node_reference[node->input(0)] -= 1;
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            blob_names.erase(node->output(0));
+
+            node2->set_op_type("HardSwish");
+            node2->clear_input();
+            node2->add_input(node->input(0));
+
+            onnx::AttributeProto* attr_alpha = node2->add_attribute();
+            attr_alpha->set_name("alpha");
+            attr_alpha->set_f(alpha);
+
+            onnx::AttributeProto* attr_beta = node2->add_attribute();
+            attr_beta->set_name("beta");
+            attr_beta->set_f(beta);
+
+            reduced_node_count += 1;
+            i += 1;
+        }
+    }
+}
+
+static void fuse_hardsigmoid(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // HardSigmoid <= Add(+3) - Clip(0,6) - Div(/6)
+        // HardSigmoid <= Add(+3) - Clip(0,6) - Mul(*(1/6))
+        // HardSigmoid <= Add(+3) - Clip(0,6) - Constant - Div(/6)
+        // HardSigmoid <= Add(+3) - Clip(0,6) - Constant - Mul(*(1/6))
+        //     out = F.relu6(x + 3, inplace=True) / 6
+        if (node->op_type() == "Add")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            if (i+2 >= node_count)
+                continue;
+
+            if (binaryop_weights.find(node->input(1)) == binaryop_weights.end())
+                continue;
+
+            const onnx::TensorProto& add_three = binaryop_weights[node->input(1)];
+            if (add_three.dims_size() != 0 || get_tensor_proto_data_size(add_three) != 1)
+                continue;
+
+            float constant_add_three = add_three.has_raw_data() ? ((const float*)add_three.raw_data().data())[0] : add_three.float_data().data()[0];
+            if (constant_add_three != 3.f)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+
+            if (node3->op_type() == "Constant")
+            {
+                if (i+3 >= node_count)
+                    continue;
+
+                node3 = mutable_graph->mutable_node(i+3);
+            }
+
+            if (node2->op_type() != "Clip" || (node3->op_type() != "Div" && node3->op_type() != "Mul"))
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+            float relu6_min;
+            float relu6_max;
+            if (node2->input_size() == 1)
+            {
+                relu6_min = get_node_attr_f(*node2, "min", -FLT_MAX);
+                relu6_max = get_node_attr_f(*node2, "max", FLT_MAX);
+            }
+            else
+            {
+                const onnx::TensorProto& min_tp = weights[node2->input(1)];
+                const onnx::TensorProto& max_tp = weights[node2->input(2)];
+                const float* min_data = min_tp.has_raw_data() ? (const float*)min_tp.raw_data().data() : min_tp.float_data().data();
+                const float* max_data = max_tp.has_raw_data() ? (const float*)max_tp.raw_data().data() : max_tp.float_data().data();
+
+                relu6_min = min_data[0];
+                relu6_max = max_data[0];
+            }
+            if (relu6_min != 0.f || relu6_max != 6.f)
+                continue;
+
+            if (binaryop_weights.find(node3->input(1)) == binaryop_weights.end())
+                continue;
+
+            const onnx::TensorProto& div_six = binaryop_weights[node3->input(1)];
+            if (div_six.dims_size() != 0 || get_tensor_proto_data_size(div_six) != 1)
+                continue;
+
+            float constant_div_six = div_six.has_raw_data() ? ((const float*)div_six.raw_data().data())[0] : div_six.float_data().data()[0];
+            if (node3->op_type() == "Div" && constant_div_six != 6.f)
+                continue;
+            if (node3->op_type() == "Mul" && constant_div_six != 1/6.f)
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+
+            reduced_binaryop_weights.push_back(node->input(1));
+            reduced_binaryop_weights.push_back(node3->input(1));
+
+            node3->set_op_type("HardSigmoid");
+            node3->clear_input();
+            node3->add_input(node->input(0));
+
+            onnx::AttributeProto* attr_alpha = node3->add_attribute();
+            attr_alpha->set_name("alpha");
+            attr_alpha->set_f(1.f/6.f);
+
+            onnx::AttributeProto* attr_beta = node3->add_attribute();
+            attr_beta->set_name("beta");
+            attr_beta->set_f(3.f/6.f);
+
+            reduced_node_count += 2;
+            i += 2;
+        }
+    }
+}
+
+static void fuse_batchnorm1d_squeeze_unsqueeze(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // BatchNormalization <= Unsqueeze - BatchNormalization - Squeeze
+        if (node->op_type() == "Unsqueeze")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            if (i+2 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+
+            if (node2->op_type() != "BatchNormalization" || node3->op_type() != "Squeeze")
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+            if (node2->input(0) != node->output(0) || node3->input(0) != node2->output(0))
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node3->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+
+            node2->set_input(0, node->input(0));
+            node2->set_output(0, node3->output(0));
+
+            reduced_node_count += 2;
+            i += 2;
+        }
+    }
+}
+
+static void fuse_unsqueeze_prelu(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // PReLU <= Unsqueeze - PReLU
+        if (node->op_type() == "Unsqueeze")
+        {
+            // check weight
+            if (weights.find(node->input(0)) == weights.end())
+                continue;
+
+            onnx::TensorProto& B = weights[node->input(0)];
+            if (B.dims_size() != 1)
+                continue;
+
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            // axes = (1, 2)
+            std::vector<int> axes = get_node_attr_ai(*node, "axes");
+            if (axes.size() != 2)
+                continue;
+            if (axes[0] != 1 || axes[1] != 2)
+                continue;
+
+            if (i+1 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+
+            if (node2->op_type() != "PRelu")
+                continue;
+
+            if (node2->input(1) != node->output(0))
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            blob_names.erase(node->output(0));
+
+            node2->set_input(1, node->input(0));
+
+            reduced_node_count += 1;
+            i += 1;
+        }
+    }
+}
+
+static void fuse_normalize(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // Normalize <= X - ReduceL2 - Clip - Shape - Expand - Div
+        if (node->op_type() == "ReduceL2")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            // axes = (1)
+            std::vector<int> axes = get_node_attr_ai(*node, "axes");
+            if (axes.size() != 1)
+                continue;
+            if (axes[0] != 1)
+                continue;
+
+            if (i+4 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+            onnx::NodeProto* node4 = mutable_graph->mutable_node(i+3);
+            onnx::NodeProto* node5 = mutable_graph->mutable_node(i+4);
+
+            if (node2->op_type() != "Clip" || node3->op_type() != "Shape" || node4->op_type() != "Expand" || node5->op_type() != "Div")
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+            if (node_reference.find(node3->output(0)) == node_reference.end() || node_reference[node3->output(0)] != 1)
+                continue;
+
+            if (node_reference.find(node4->output(0)) == node_reference.end() || node_reference[node4->output(0)] != 1)
+                continue;
+
+            if (node2->input(0) != node->output(0) || node3->input(0) != node->input(0)
+                || node4->input(0) != node2->output(0) || node4->input(1) != node3->output(0)
+                || node5->input(0) != node->input(0) || node5->input(1) != node4->output(0))
+                continue;
+
+            // +eps
+            float clip_min;
+            if (node2->input_size() == 1)
+            {
+                clip_min = get_node_attr_f(*node2, "min", -FLT_MAX);
+            }
+            else
+            {
+                const onnx::TensorProto& min_tp = weights[node2->input(1)];
+                const float* min_data = min_tp.has_raw_data() ? (const float*)min_tp.raw_data().data() : min_tp.float_data().data();
+
+                clip_min = min_data[0];
+            }
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+            node3->set_op_type("noop_reducedncnn");
+            node4->set_op_type("noop_reducedncnn");
+
+            node_reference[node->input(0)] -= 2;
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            node_reference.erase(node_reference.find(node3->output(0)));
+            node_reference.erase(node_reference.find(node4->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+            blob_names.erase(node3->output(0));
+            blob_names.erase(node4->output(0));
+
+            node5->set_op_type("Normalize");
+            node5->clear_input();
+            node5->add_input(node->input(0));
+
+            onnx::AttributeProto* attr_alpha = node5->add_attribute();
+            attr_alpha->set_name("eps");
+            attr_alpha->set_f(clip_min);
+
+            reduced_node_count += 4;
+            i += 4;
+        }
+    }
+}
+
+static void fuse_flatten(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // Flatten <= X - Shape - Gather - Constant - Unsqueeze - Unsqueeze - Concat - Reshape
+        if (node->op_type() == "Shape")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            if (i+6 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+            onnx::NodeProto* node4 = mutable_graph->mutable_node(i+3);
+            onnx::NodeProto* node5 = mutable_graph->mutable_node(i+4);
+            onnx::NodeProto* node6 = mutable_graph->mutable_node(i+5);
+            onnx::NodeProto* node7 = mutable_graph->mutable_node(i+6);
+
+            if (node2->op_type() != "Gather" || node3->op_type() != "Constant" || node4->op_type() != "Unsqueeze" || node5->op_type() != "Unsqueeze"
+                || node6->op_type() != "Concat" || node7->op_type() != "Reshape")
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+//             if (node_reference.find(node3->output(0)) == node_reference.end() || node_reference[node3->output(0)] != 1)
+//                 continue;
+
+            if (node_reference.find(node4->output(0)) == node_reference.end() || node_reference[node4->output(0)] != 1)
+                continue;
+
+            if (node_reference.find(node5->output(0)) == node_reference.end() || node_reference[node5->output(0)] != 1)
+                continue;
+
+            if (node_reference.find(node6->output(0)) == node_reference.end() || node_reference[node6->output(0)] != 1)
+                continue;
+
+            if (node2->input(0) != node->output(0) || node4->input(0) != node2->output(0) || node5->input(0) != node3->output(0)
+                || node6->input(0) != node4->output(0) || node6->input(1) != node5->output(0)
+                || node7->input(0) != node->input(0) || node7->input(1) != node6->output(0))
+                continue;
+
+            // axis = 0
+            int gather_axis = get_node_attr_i(*node2, "axis");
+            if (gather_axis != 0)
+                continue;
+
+            // indices = 0
+            if (weights.find(node2->input(1)) == weights.end())
+                continue;
+
+            std::vector<int> gather_indices = get_node_attr_from_input_ai(weights[node2->input(1)]);
+            if (gather_indices.size() != 1 || gather_indices[0] != 0)
+                continue;
+
+            // axes = (0)
+            std::vector<int> unsqueeze_axes = get_node_attr_ai(*node4, "axes");
+            if (unsqueeze_axes.size() != 1)
+                continue;
+            if (unsqueeze_axes[0] != 0)
+                continue;
+
+            // axes = (0)
+            std::vector<int> unsqueeze2_axes = get_node_attr_ai(*node5, "axes");
+            if (unsqueeze2_axes.size() != 1)
+                continue;
+            if (unsqueeze2_axes[0] != 0)
+                continue;
+
+            // data = -1
+            if (weights.find(node5->input(0)) == weights.end())
+                continue;
+
+            std::vector<int> unsqueeze2_data = get_node_attr_from_input_ai(weights[node5->input(0)]);
+            if (unsqueeze2_data.size() != 1 || unsqueeze2_data[0] != -1)
+                continue;
+
+            // axis = 0
+            int concat_axis = get_node_attr_i(*node6, "axis");
+            if (concat_axis != 0)
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+//             node3->set_op_type("noop_reducedncnn");
+            node4->set_op_type("noop_reducedncnn");
+            node5->set_op_type("noop_reducedncnn");
+            node6->set_op_type("noop_reducedncnn");
+
+            node_reference[node->input(0)] -= 1;
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+//             node_reference.erase(node_reference.find(node3->output(0)));
+            node_reference.erase(node_reference.find(node4->output(0)));
+            node_reference.erase(node_reference.find(node5->output(0)));
+            node_reference.erase(node_reference.find(node6->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+//             blob_names.erase(node3->output(0));
+            blob_names.erase(node4->output(0));
+            blob_names.erase(node5->output(0));
+            blob_names.erase(node6->output(0));
+
+            node7->set_op_type("Flatten");
+            node7->clear_input();
+            node7->add_input(node->input(0));
+
+            reduced_node_count += 5;
+            i += 5;
+        }
+    }
+}
+
+static void fuse_pixelshuffle(onnx::GraphProto* mutable_graph, std::map<std::string, onnx::TensorProto>& weights, std::map<std::string, onnx::TensorProto>& binaryop_weights, std::map<std::string, int>& node_reference, std::set<std::string>& blob_names, int& reduced_node_count, std::vector<std::string>& reduced_binaryop_weights)
+{
+    int node_count = mutable_graph->node_size();
+    for (int i=0; i<node_count; i++)
+    {
+        onnx::NodeProto* node = mutable_graph->mutable_node(i);
+
+        // PixelShuffle <= Reshape - Transpose - Reshape
+        // PixelShuffle <= Reshape - Transpose - Constant - Reshape
+        if (node->op_type() == "Reshape")
+        {
+            if (node_reference.find(node->output(0)) == node_reference.end() || node_reference[node->output(0)] != 1)
+                continue;
+
+            std::vector<int> shape;
+            if (node->input_size() == 1)
+            {
+                shape = get_node_attr_ai(*node, "shape");
+            }
+            else
+            {
+                // skip weight reshape
+                if (weights.find(node->input(1)) == weights.end())
+                    continue;
+
+                shape = get_node_attr_from_input_ai(weights[node->input(1)]);
+            }
+
+            // -1, 3, upscale_factor, upscale_factor, height, width
+            if (shape.size() != 6)
+                continue;
+
+            if (shape[0] != 1 && shape[0] != -1)
+                continue;
+
+            if (shape[2] != shape[3])
+                continue;
+
+            if (i+2 >= node_count)
+                continue;
+
+            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
+            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
+
+            if (node3->op_type() == "Constant")
+            {
+                if (i+3 >= node_count)
+                    continue;
+
+                node3 = mutable_graph->mutable_node(i+3);
+            }
+
+            if (node2->op_type() != "Transpose" || node3->op_type() != "Reshape")
+                continue;
+
+            if (node_reference.find(node2->output(0)) == node_reference.end() || node_reference[node2->output(0)] != 1)
+                continue;
+
+            // 0 1 4 2 5 3
+            std::vector<int> perm = get_node_attr_ai(*node2, "perm");
+            if (perm.size() != 6)
+                continue;
+
+            if (perm[0] != 0 || perm[1] != 1 || perm[2] != 4 || perm[3] != 2 || perm[4] != 5 || perm[5] != 3)
+                continue;
+
+            std::vector<int> shape3;
+            if (node3->input_size() == 1)
+            {
+                shape3 = get_node_attr_ai(*node3, "shape");
+            }
+            else
+            {
+                // skip weight reshape
+                if (weights.find(node3->input(1)) == weights.end())
+                    continue;
+
+                shape3 = get_node_attr_from_input_ai(weights[node3->input(1)]);
+            }
+
+            // -1, 3, height, width
+            if (shape3.size() != 4)
+                continue;
+
+            if (shape3[0] != 1 && shape3[0] != -1)
+                continue;
+
+            if (shape3[1] != shape[1] && shape3[2] != shape[2] * shape[4] && shape3[3] != shape[3] * shape[5])
+                continue;
+
+            // reduce
+            node->set_op_type("noop_reducedncnn");
+            node2->set_op_type("noop_reducedncnn");
+
+            node_reference.erase(node_reference.find(node->output(0)));
+            node_reference.erase(node_reference.find(node2->output(0)));
+            blob_names.erase(node->output(0));
+            blob_names.erase(node2->output(0));
+
+            node3->set_op_type("PixelShuffle");
+            node3->set_input(0, node->input(0));
+
+            onnx::AttributeProto* attr_group = node3->add_attribute();
+            attr_group->set_name("scale_factor");
+            attr_group->set_i(shape[2]);
+
+            reduced_node_count += 2;
+            i += 2;
         }
     }
 }
@@ -292,7 +1185,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         else
         {
             bool isBinaryOp = false;
-            if (op == "Add" || op == "Mul")
+            if (op == "Add" || op == "Mul" || op == "Div")
             {
                 isBinaryOp = true;
             }
@@ -335,9 +1228,22 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             {
                 node_reference[input_name] = node_reference[input_name] + 1;
             }
+
+            if (op == "LSTM")
+            {
+                // ignore all optional input blobs
+                break;
+            }
         }
 
         if (op == "Dropout")
+        {
+            const std::string& output_name = node.output(0);
+            blob_names.insert(output_name);
+            continue;
+        }
+
+        if (op == "LSTM")
         {
             const std::string& output_name = node.output(0);
             blob_names.insert(output_name);
@@ -373,163 +1279,16 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 
     // op chain fusion
     int reduced_node_count = 0;
-    for (int i=0; i<node_count; i++)
-    {
-        onnx::NodeProto* node = mutable_graph->mutable_node(i);
-
-        // MatMul <= Transpose(weight) - MatMul
-        if (node->op_type() == "Transpose")
-        {
-            // check weight
-            if (weights.find(node->input(0)) == weights.end())
-                continue;
-
-            onnx::TensorProto& B = weights[node->input(0)];
-            if (B.dims_size() != 2)
-                continue;
-
-            if (node_reference[node->output(0)] != 1)
-                continue;
-
-            // perm = (1, 0)
-            std::vector<int> perm = get_node_attr_ai(*node, "perm");
-            if (perm.size() != 2)
-                continue;
-            if (perm[0] != 1 || perm[1] != 0)
-                continue;
-
-            if (i+1 >= node_count)
-                continue;
-
-            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
-
-            if (node2->op_type() != "MatMul")
-                continue;
-
-            // reduce
-            node->set_op_type("noop_reducedncnn");
-
-            node_reference.erase(node_reference.find(node->output(0)));
-            blob_names.erase(node->output(0));
-
-            node2->set_input(1, node->input(0));
-
-            // permute weight
-            {
-                const int h = B.dims(0);
-                const int w = B.dims(1);
-
-                std::vector<float> permuted_data;
-                permuted_data.reserve(h * w);
-                const float* bptr = B.has_raw_data() ? (const float*)B.raw_data().data() : B.float_data().data();
-
-                for (int j=0; j<w; j++)
-                {
-                    for (int k=0; k<h; k++)
-                    {
-                        float vb = bptr[ k*w + j ];
-                        permuted_data.push_back(vb);
-                    }
-                }
-
-                B.set_dims(0, w);
-                B.set_dims(1, h);
-
-                if (B.has_raw_data())
-                {
-                    B.set_raw_data(permuted_data.data(), permuted_data.size() * sizeof(float));
-                }
-                else
-                {
-                    for (int j=0; j<(int)permuted_data.size(); j++)
-                        B.set_float_data(j, permuted_data[j]);
-                }
-            }
-
-            reduced_node_count += 1;
-            i += 1;
-        }
-
-        // ShuffleChannel <= Reshape - Transpose - Reshape
-        if (node->op_type() == "Reshape")
-        {
-            if (node_reference[node->output(0)] != 1)
-                continue;
-
-            std::vector<int> shape;
-            if (node->input_size() == 1)
-            {
-                shape = get_node_attr_ai(*node, "shape");
-            }
-            else
-            {
-                shape = get_tensor_proto_reshape_shape(weights[node->input(1)]);
-            }
-
-            // 1 groups channels_per_group, height, width
-            if (shape.size() != 5)
-                continue;
-
-            if (shape[0] != 1)
-                continue;
-
-            if (i+2 >= node_count)
-                continue;
-
-            onnx::NodeProto* node2 = mutable_graph->mutable_node(i+1);
-            onnx::NodeProto* node3 = mutable_graph->mutable_node(i+2);
-
-            if (node2->op_type() != "Transpose" || node3->op_type() != "Reshape")
-                continue;
-
-            if (node_reference[node2->output(0)] != 1)
-                continue;
-
-            // 0 2 1 3 4
-            std::vector<int> perm = get_node_attr_ai(*node2, "perm");
-            if (perm.size() != 5)
-                continue;
-
-            if (perm[0] != 0 || perm[1] != 2 || perm[2] != 1 || perm[3] != 3 || perm[4] != 4)
-                continue;
-
-            std::vector<int> shape3;
-            if (node3->input_size() == 1)
-            {
-                shape3 = get_node_attr_ai(*node3, "shape");
-            }
-            else
-            {
-                shape3 = get_tensor_proto_reshape_shape(weights[node3->input(1)]);
-            }
-
-            // 1, -1, height, width
-            if (shape3.size() != 4)
-                continue;
-
-            if (shape3[0] != 1 || shape3[1] != -1)
-                continue;
-
-            // reduce
-            node->set_op_type("noop_reducedncnn");
-            node2->set_op_type("noop_reducedncnn");
-
-            node_reference.erase(node_reference.find(node->output(0)));
-            node_reference.erase(node_reference.find(node2->output(0)));
-            blob_names.erase(node->output(0));
-            blob_names.erase(node2->output(0));
-
-            node3->set_op_type("ShuffleChannel");
-            node3->set_input(0, node->input(0));
-
-            onnx::AttributeProto* attr_group = node3->add_attribute();
-            attr_group->set_name("group");
-            attr_group->set_i(shape[1]);
-
-            reduced_node_count += 2;
-            i += 2;
-        }
-    }
+    std::vector<std::string> reduced_binaryop_weights;
+    fuse_matmul         (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_shufflechannel (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_hardsigmoid    (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_hardswish      (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_batchnorm1d_squeeze_unsqueeze(mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_unsqueeze_prelu(mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_normalize      (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_flatten        (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
+    fuse_pixelshuffle   (mutable_graph, weights, binaryop_weights, node_reference, blob_names, reduced_node_count, reduced_binaryop_weights);
 
     // remove node_reference entry with reference equals to one
     int splitncnn_blob_count = 0;
@@ -548,7 +1307,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         }
     }
 
-    fprintf(pp, "%lu %lu\n", node_count - reduced_node_count + input_node_count + node_reference.size() + graph.initializer_size() - weights.size(), blob_names.size() + splitncnn_blob_count);
+    fprintf(pp, "%lu %lu\n", node_count - reduced_node_count + input_node_count + node_reference.size() + graph.initializer_size() - weights.size() - reduced_binaryop_weights.size(), blob_names.size() - reduced_binaryop_weights.size() + splitncnn_blob_count);
 
     int internal_split = 0;
 
@@ -589,12 +1348,11 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
     }
 
     // place MemoryData next
-    for (int j=0; j<graph.input_size(); j++)
+    for (std::map<std::string, onnx::TensorProto>::iterator it = binaryop_weights.begin(); it != binaryop_weights.end(); it++)
     {
-        const std::string& input_name = graph.input(j).name();
+        const std::string& input_name = it->first;
 
-        // check weight before BinaryOp
-        if (binaryop_weights.find(input_name) == binaryop_weights.end())
+        if (std::find(reduced_binaryop_weights.begin(), reduced_binaryop_weights.end(), input_name) != reduced_binaryop_weights.end())
             continue;
 
         fprintf(pp, "%-16s %-24s 0 1 %s", "MemoryData", input_name.c_str(), input_name.c_str());
@@ -603,20 +1361,46 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 
         if (M.dims_size() == 0) {
             fprintf(pp, " 0=%d", get_tensor_proto_data_size(M));
-        } if (M.dims_size() == 1) {
+        } else if (M.dims_size() == 1) {
             fprintf(pp, " 0=%d", (int)M.dims(0));
         } else if (M.dims_size() == 2) {
             fprintf(pp, " 0=%d", (int)M.dims(1));
-            fprintf(pp, " 1=%d", (int)M.dims(0));
         } else if (M.dims_size() == 3) {
             fprintf(pp, " 0=%d", (int)M.dims(2));
             fprintf(pp, " 1=%d", (int)M.dims(1));
-            fprintf(pp, " 2=%d", (int)M.dims(0));
+        } else if (M.dims_size() == 4) {
+            fprintf(pp, " 0=%d", (int)M.dims(3));
+            fprintf(pp, " 1=%d", (int)M.dims(2));
+            fprintf(pp, " 2=%d", (int)M.dims(1));
         }
 
         fprintf(pp, "\n");
 
         fwrite_tensor_proto_data(M, bp);
+
+        // split the input
+        if (node_reference.find(input_name) == node_reference.end()){
+            continue;
+        }
+
+        int refcount = node_reference[input_name];
+        if (refcount <= 1){
+            continue;
+        }
+
+        char splitname[256];
+        sprintf(splitname, "splitncnn_%d", internal_split);
+        fprintf(pp, "%-16s %-24s %d %d", "Split", splitname, 1, refcount);
+
+        fprintf(pp, " %s", input_name.c_str());
+
+        for (int k=0; k<refcount; k++)
+        {
+            fprintf(pp, " %s_splitncnn_%d", input_name.c_str(), k);
+        }
+        fprintf(pp, "\n");
+
+        internal_split++;
     }
 
     for (int i=0; i<node_count; i++)
@@ -658,7 +1442,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         {
             const std::string& output_name = node.output(j);
             fprintf(stderr, "  output = %s\n", output_name.c_str());
-        } 
+        }
         */
 
         if (op == "Abs")
@@ -706,6 +1490,9 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             // check weight before BinaryOp
             if (binaryop_weights.find(node.output(0)) != binaryop_weights.end())
             {
+                if (std::find(reduced_binaryop_weights.begin(), reduced_binaryop_weights.end(), node.output(0)) != reduced_binaryop_weights.end())
+                    continue;
+
                 fprintf(pp, "%-16s", "MemoryData");
             }
             else
@@ -734,6 +1521,10 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         else if (op == "Cos")
         {
             fprintf(pp, "%-16s", "UnaryOp");
+        }
+        else if (op == "DepthToSpace")
+        {
+            fprintf(pp, "%-16s", "PixelShuffle");
         }
         else if (op == "Div")
         {
@@ -786,6 +1577,14 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         {
             fprintf(pp, "%-16s", "Pooling");
         }
+        else if (op == "HardSigmoid")
+        {
+            fprintf(pp, "%-16s", "HardSigmoid");
+        }
+        else if (op == "HardSwish")
+        {
+            fprintf(pp, "%-16s", "HardSwish");
+        }
         else if (op == "ImageScaler")
         {
             fprintf(pp, "%-16s", "Scale");
@@ -805,6 +1604,13 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         else if (op == "LRN")
         {
             fprintf(pp, "%-16s", "LRN");
+        }
+        else if (op == "LSTM")
+        {
+            fprintf(pp, "%-16s", "LSTM");
+            // force no output hidden and cell blob
+            input_size = 1;
+            output_size = 1;
         }
         else if (op == "MatMul")
         {
@@ -826,9 +1632,17 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         {
             fprintf(pp, "%-16s", "UnaryOp");
         }
+        else if (op == "Normalize")
+        {
+            fprintf(pp, "%-16s", "Normalize");
+        }
         else if (op == "Pad")
         {
             fprintf(pp, "%-16s", "Padding");
+        }
+        else if (op == "PixelShuffle")
+        {
+            fprintf(pp, "%-16s", "PixelShuffle");
         }
         else if (op == "Pow")
         {
@@ -841,6 +1655,12 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         else if (op == "Reciprocal")
         {
             fprintf(pp, "%-16s", "UnaryOp");
+        }
+        else if (op == "ReduceMax" || op == "ReduceMin" || op == "ReduceMean" ||
+                op == "ReduceProd" || op == "ReduceSum" || op == "ReduceSumSquare" ||
+                op == "ReduceL1" || op == "ReduceL2" || op == "ReduceLogSum" || op == "ReduceLogSumExp")
+        {
+            fprintf(pp, "%-16s", "Reduction");
         }
         else if (op == "Relu")
         {
@@ -880,9 +1700,17 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         {
             fprintf(pp, "%-16s", "Softmax");
         }
+        else if (op == "Split")
+        {
+            fprintf(pp, "%-16s", "Slice");
+        }
         else if (op == "Sqrt")
         {
             fprintf(pp, "%-16s", "UnaryOp");
+        }
+        else if (op == "Squeeze")
+        {
+            fprintf(pp, "%-16s", "Squeeze");
         }
         else if (op == "Sub")
         {
@@ -908,6 +1736,10 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         {
             fprintf(pp, "%-16s", "Interp");
         }
+        else if (op == "Unsqueeze")
+        {
+            fprintf(pp, "%-16s", "ExpandDims");
+        }
         else
         {
             return tl::make_unexpected(op + " not supported yet!");
@@ -915,7 +1747,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 
         fprintf(pp, " %-24s %d %d", name.c_str(), input_size, output_size);
 
-        for (int j=0; j<node.input_size(); j++)
+        for (int j=0; j<input_size; j++)
         {
             std::string input_name = node.input(j);
 
@@ -972,7 +1804,8 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         }
         else if (op == "AveragePool" || op == "MaxPool")
         {
-            std::string auto_pad = get_node_attr_s(node, "auto_pad");//TODO
+            std::string auto_pad = get_node_attr_s(node, "auto_pad");
+            int ceil_mode = get_node_attr_i(node, "ceil_mode", 0);
             std::vector<int> kernel_shape = get_node_attr_ai(node, "kernel_shape");
             std::vector<int> strides = get_node_attr_ai(node, "strides");
             std::vector<int> pads = get_node_attr_ai(node, "pads");
@@ -980,10 +1813,18 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int pool = op == "AveragePool" ? 1 : 0;
             int pad_mode = 1;
 
-            if (auto_pad == "SAME_LOWER" || auto_pad == "SAME_UPPER")
+            if (auto_pad == "SAME_UPPER")
             {
-                // TODO
                 pad_mode = 2;
+            }
+            else if (auto_pad == "SAME_LOWER")
+            {
+                pad_mode = 3;
+            }
+
+            if (ceil_mode == 1)
+            {
+                pad_mode = 0;
             }
 
             fprintf(pp, " 0=%d", pool);
@@ -1015,6 +1856,12 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
 
             fprintf(pp, " 5=%d", pad_mode);
+
+            if (op == "AveragePool")
+            {
+                int avgpool_count_include_pad = get_node_attr_i(node, "count_include_pad", 0);
+                fprintf(pp, " 6=%d", avgpool_count_include_pad);
+            }
         }
         else if (op == "BatchNormalization")
         {
@@ -1050,10 +1897,26 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         }
         else if (op == "Clip")
         {
-            float min = get_node_attr_f(node, "min", -FLT_MAX);
-            float max = get_node_attr_f(node, "max", FLT_MAX);
-            fprintf(pp, " 0=%f", min);
-            fprintf(pp, " 1=%f", max);
+            float min;
+            float max;
+            if (node.input_size() == 1)
+            {
+                min = get_node_attr_f(node, "min", -FLT_MAX);
+                max = get_node_attr_f(node, "max", FLT_MAX);
+            }
+            else
+            {
+                const onnx::TensorProto& min_tp = weights[node.input(1)];
+                const onnx::TensorProto& max_tp = weights[node.input(2)];
+                const float* min_data = min_tp.has_raw_data() ? (const float*)min_tp.raw_data().data() : min_tp.float_data().data();
+                const float* max_data = max_tp.has_raw_data() ? (const float*)max_tp.raw_data().data() : max_tp.float_data().data();
+
+                min = min_data[0];
+                max = max_data[0];
+            }
+
+            fprintf(pp, " 0=%e", min);
+            fprintf(pp, " 1=%e", max);
         }
         else if (op == "Concat")
         {
@@ -1067,7 +1930,9 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             {
                 const onnx::TensorProto& M = binaryop_weights[name];
 
-                if (M.dims_size() == 1) {
+                if (M.dims_size() == 0) {
+                    fprintf(pp, " 0=%d", get_tensor_proto_data_size(M));
+                } else if (M.dims_size() == 1) {
                     fprintf(pp, " 0=%d", (int)M.dims(0));
                 } else if (M.dims_size() == 2) {
                     fprintf(pp, " 0=%d", (int)M.dims(1));
@@ -1090,7 +1955,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int num_filter = W.dims(0);
             int has_bias = node.input_size() == 3 ? 1 : 0;
 
-            std::string auto_pad = get_node_attr_s(node, "auto_pad");//TODO
+            std::string auto_pad = get_node_attr_s(node, "auto_pad");
             std::vector<int> kernel_shape = get_node_attr_ai(node, "kernel_shape");
             std::vector<int> dilations = get_node_attr_ai(node, "dilations");
             std::vector<int> strides = get_node_attr_ai(node, "strides");
@@ -1120,10 +1985,13 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 fprintf(pp, " 13=%d", strides[0]);
             }
 
-            if (auto_pad == "SAME_LOWER" || auto_pad == "SAME_UPPER")
+            if (auto_pad == "SAME_UPPER")
             {
-                // TODO
                 fprintf(pp, " 4=-233");
+            }
+            else if (auto_pad == "SAME_LOWER")
+            {
+                fprintf(pp, " 4=-234");
             }
             else
             {
@@ -1136,7 +2004,8 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             } else if (pads.size() == 4) {
                 fprintf(pp, " 4=%d", pads[1]);
                 fprintf(pp, " 14=%d", pads[0]);
-                // TODO hpad2=pads[2]   wpad2=pads[3]
+                fprintf(pp, " 15=%d", pads[3]);
+                fprintf(pp, " 16=%d", pads[2]);
             }
 
             }
@@ -1166,12 +2035,12 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 
             int has_bias = node.input_size() == 3 ? 1 : 0;
 
-            std::string auto_pad = get_node_attr_s(node, "auto_pad");//TODO
+            std::string auto_pad = get_node_attr_s(node, "auto_pad");
             std::vector<int> kernel_shape = get_node_attr_ai(node, "kernel_shape");
             std::vector<int> dilations = get_node_attr_ai(node, "dilations");
             std::vector<int> strides = get_node_attr_ai(node, "strides");
-            std::vector<int> output_padding = get_node_attr_ai(node, "output_padding");//TODO implement adj
-            std::vector<int> output_shape = get_node_attr_ai(node, "output_shape");//TODO
+            std::vector<int> output_padding = get_node_attr_ai(node, "output_padding");
+            std::vector<int> output_shape = get_node_attr_ai(node, "output_shape");
             std::vector<int> pads = get_node_attr_ai(node, "pads");
             int group = get_node_attr_i(node, "group", 1);
             int num_filter = W.dims(1) * group;
@@ -1199,10 +2068,13 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 fprintf(pp, " 13=%d", strides[0]);
             }
 
-            if (auto_pad == "SAME_LOWER" || auto_pad == "SAME_UPPER")
+            if (auto_pad == "SAME_UPPER")
             {
-                // TODO
                 fprintf(pp, " 4=-233");
+            }
+            else if (auto_pad == "SAME_LOWER")
+            {
+                fprintf(pp, " 4=-234");
             }
             else
             {
@@ -1215,9 +2087,24 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             } else if (pads.size() == 4) {
                 fprintf(pp, " 4=%d", pads[1]);
                 fprintf(pp, " 14=%d", pads[0]);
-                // TODO hpad2=pads[2]   wpad2=pads[3]
+                fprintf(pp, " 15=%d", pads[3]);
+                fprintf(pp, " 16=%d", pads[2]);
             }
 
+            }
+
+            if (output_padding.size() == 1) {
+                fprintf(pp, " 18=%d", output_padding[0]);
+            } else if (output_padding.size() == 2) {
+                fprintf(pp, " 18=%d", output_padding[1]);
+                fprintf(pp, " 19=%d", output_padding[0]);
+            }
+
+            if (output_shape.size() == 1) {
+                fprintf(pp, " 20=%d", output_shape[0]);
+            } else if (output_shape.size() == 2) {
+                fprintf(pp, " 20=%d", output_shape[1]);
+                fprintf(pp, " 21=%d", output_shape[0]);
             }
 
             fprintf(pp, " 5=%d", has_bias);
@@ -1276,6 +2163,20 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int op_type = 10;
             fprintf(pp, " 0=%d", op_type);
         }
+        else if (op == "DepthToSpace")
+        {
+            // pixelshuffle
+            std::string mode = get_node_attr_s(node, "mode");
+            if (mode == "CRD")
+            {
+                int scale_factor = get_node_attr_i(node, "blocksize", 1);
+                fprintf(pp, " 0=%d", scale_factor);
+            }
+            else
+            {
+                fprintf(stderr, "Unsupported DepthToSpace mode %s!\n", mode.c_str());
+            }
+        }
         else if (op == "Div")
         {
             int op_type = 3;
@@ -1288,7 +2189,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         else if (op == "Elu")
         {
             float alpha = get_node_attr_f(node, "alpha", 1.f);
-            fprintf(pp, " 0=%f", alpha);
+            fprintf(pp, " 0=%e", alpha);
         }
         else if (op == "Exp")
         {
@@ -1351,6 +2252,22 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             fprintf(pp, " 0=%d", pool);
             fprintf(pp, " 4=%d", global_pool);
         }
+        else if (op == "HardSigmoid")
+        {
+            float alpha = get_node_attr_f(node, "alpha", 0.2f);
+            float beta = get_node_attr_f(node, "beta", 0.5f);
+
+            fprintf(pp, " 0=%e", alpha);
+            fprintf(pp, " 1=%e", beta);
+        }
+        else if (op == "HardSwish")
+        {
+            float alpha = get_node_attr_f(node, "alpha", 0.2f);
+            float beta = get_node_attr_f(node, "beta", 0.5f);
+
+            fprintf(pp, " 0=%e", alpha);
+            fprintf(pp, " 1=%e", beta);
+        }
         else if (op == "ImageScaler")
         {
             std::vector<float> bias = get_node_attr_af(node, "bias");
@@ -1375,7 +2292,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int channels = get_tensor_proto_data_size(scale);
 
             fprintf(pp, " 0=%d", channels);
-            fprintf(pp, " 1=%f", eps);
+            fprintf(pp, " 1=%e", eps);
             fwrite_tensor_proto_data(scale, bp);
             fwrite_tensor_proto_data(B, bp);
         }
@@ -1383,7 +2300,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         {
             float alpha = get_node_attr_f(node, "alpha", 0.01f);
 
-            fprintf(pp, " 0=%f", alpha);
+            fprintf(pp, " 0=%e", alpha);
         }
         else if (op == "Log")
         {
@@ -1401,9 +2318,171 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 
             fprintf(pp, " 0=%d", norm_region);
             fprintf(pp, " 1=%d", size);
-            fprintf(pp, " 2=%f", alpha);
-            fprintf(pp, " 3=%f", beta);
-            fprintf(pp, " 4=%f", bias);
+            fprintf(pp, " 2=%e", alpha);
+            fprintf(pp, " 3=%e", beta);
+            fprintf(pp, " 4=%e", bias);
+        }
+        else if (op == "LSTM")
+        {
+            const onnx::TensorProto& W = weights[node.input(1)];
+            const onnx::TensorProto& R = weights[node.input(2)];
+            const onnx::TensorProto& B = weights[node.input(3)];
+
+            int hidden_size = get_node_attr_i(node, "hidden_size", 0);
+            std::string direction = get_node_attr_s(node, "direction");
+
+            int direction_type = 0;
+            if (direction == "forward")
+            {
+                direction_type = 0;
+            }
+            else if (direction == "reverse")
+            {
+                direction_type = 1;
+            }
+            else if (direction == "bidirectional")
+            {
+                direction_type = 2;
+            }
+
+            int weight_data_size = get_tensor_proto_data_size(W);
+
+            fprintf(pp, " 0=%d", hidden_size);
+            fprintf(pp, " 1=%d", weight_data_size);
+            fprintf(pp, " 2=%d", direction_type);
+
+            int num_directions = direction_type == 2 ? 2 : 1;
+
+            int quantize_tag = 0;
+
+            // reorder num_directions-IOFG-hidden-size to num_directions-IFOG-hidden-size
+            {
+                fwrite(&quantize_tag, sizeof(int), 1, bp);
+
+                int weight_data_size_g = get_tensor_proto_data_size(W) / 4 / num_directions;
+                const float* wptr = W.has_raw_data() ? (const float*)W.raw_data().data() : W.float_data().data();
+
+                const float* iptr = wptr;
+                const float* optr = wptr + weight_data_size_g;
+                const float* fptr = wptr + weight_data_size_g * 2;
+                const float* gptr = wptr + weight_data_size_g * 3;
+                fwrite(iptr, sizeof(float), weight_data_size_g, bp);
+                fwrite(fptr, sizeof(float), weight_data_size_g, bp);
+                fwrite(optr, sizeof(float), weight_data_size_g, bp);
+                fwrite(gptr, sizeof(float), weight_data_size_g, bp);
+
+                if (direction_type == 2)
+                {
+                    iptr += weight_data_size_g * 4;
+                    optr += weight_data_size_g * 4;
+                    fptr += weight_data_size_g * 4;
+                    gptr += weight_data_size_g * 4;
+                    fwrite(iptr, sizeof(float), weight_data_size_g, bp);
+                    fwrite(fptr, sizeof(float), weight_data_size_g, bp);
+                    fwrite(optr, sizeof(float), weight_data_size_g, bp);
+                    fwrite(gptr, sizeof(float), weight_data_size_g, bp);
+                }
+            }
+
+            // reduce xc and hc bias
+            // reorder num_directions-IOFG-hidden to num_directions-IFOG-hidden
+            {
+                fwrite(&quantize_tag, sizeof(int), 1, bp);
+
+                int bias_data_size_g = get_tensor_proto_data_size(B) / 2 / 4 / num_directions;
+                const float* xcbptr = B.has_raw_data() ? (const float*)B.raw_data().data() : B.float_data().data();
+                const float* xiptr = xcbptr;
+                const float* xoptr = xcbptr + bias_data_size_g;
+                const float* xfptr = xcbptr + bias_data_size_g * 2;
+                const float* xgptr = xcbptr + bias_data_size_g * 3;
+                const float* hiptr = xcbptr + bias_data_size_g * 4;
+                const float* hoptr = xcbptr + bias_data_size_g * 5;
+                const float* hfptr = xcbptr + bias_data_size_g * 6;
+                const float* hgptr = xcbptr + bias_data_size_g * 7;
+
+                for (int j=0; j<bias_data_size_g; j++)
+                {
+                    float vb = xiptr[j] + hiptr[j];
+                    fwrite(&vb, sizeof(float), 1, bp);
+                }
+                for (int j=0; j<bias_data_size_g; j++)
+                {
+                    float vb = xfptr[j] + hfptr[j];
+                    fwrite(&vb, sizeof(float), 1, bp);
+                }
+                for (int j=0; j<bias_data_size_g; j++)
+                {
+                    float vb = xoptr[j] + hoptr[j];
+                    fwrite(&vb, sizeof(float), 1, bp);
+                }
+                for (int j=0; j<bias_data_size_g; j++)
+                {
+                    float vb = xgptr[j] + hgptr[j];
+                    fwrite(&vb, sizeof(float), 1, bp);
+                }
+
+                if (direction_type == 2)
+                {
+                    xiptr += bias_data_size_g * 8;
+                    xoptr += bias_data_size_g * 8;
+                    xfptr += bias_data_size_g * 8;
+                    xgptr += bias_data_size_g * 8;
+                    hiptr += bias_data_size_g * 8;
+                    hoptr += bias_data_size_g * 8;
+                    hfptr += bias_data_size_g * 8;
+                    hgptr += bias_data_size_g * 8;
+
+                    for (int j=0; j<bias_data_size_g; j++)
+                    {
+                        float vb = xiptr[j] + hiptr[j];
+                        fwrite(&vb, sizeof(float), 1, bp);
+                    }
+                    for (int j=0; j<bias_data_size_g; j++)
+                    {
+                        float vb = xfptr[j] + hfptr[j];
+                        fwrite(&vb, sizeof(float), 1, bp);
+                    }
+                    for (int j=0; j<bias_data_size_g; j++)
+                    {
+                        float vb = xoptr[j] + hoptr[j];
+                        fwrite(&vb, sizeof(float), 1, bp);
+                    }
+                    for (int j=0; j<bias_data_size_g; j++)
+                    {
+                        float vb = xgptr[j] + hgptr[j];
+                        fwrite(&vb, sizeof(float), 1, bp);
+                    }
+                }
+            }
+
+            // reorder num_directions-IOFG-hidden-hidden to num_directions-IFOG-hidden-hidden
+            {
+                fwrite(&quantize_tag, sizeof(int), 1, bp);
+
+                int weight_data_size_g = get_tensor_proto_data_size(R) / 4 / num_directions;
+                const float* rptr = R.has_raw_data() ? (const float*)R.raw_data().data() : R.float_data().data();
+
+                const float* iptr = rptr;
+                const float* optr = rptr + weight_data_size_g;
+                const float* fptr = rptr + weight_data_size_g * 2;
+                const float* gptr = rptr + weight_data_size_g * 3;
+                fwrite(iptr, sizeof(float), weight_data_size_g, bp);
+                fwrite(fptr, sizeof(float), weight_data_size_g, bp);
+                fwrite(optr, sizeof(float), weight_data_size_g, bp);
+                fwrite(gptr, sizeof(float), weight_data_size_g, bp);
+
+                if (direction_type == 2)
+                {
+                    iptr += weight_data_size_g * 4;
+                    optr += weight_data_size_g * 4;
+                    fptr += weight_data_size_g * 4;
+                    gptr += weight_data_size_g * 4;
+                    fwrite(iptr, sizeof(float), weight_data_size_g, bp);
+                    fwrite(fptr, sizeof(float), weight_data_size_g, bp);
+                    fwrite(optr, sizeof(float), weight_data_size_g, bp);
+                    fwrite(gptr, sizeof(float), weight_data_size_g, bp);
+                }
+            }
         }
         else if (op == "MatMul")
         {
@@ -1457,11 +2536,33 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int op_type = 1;
             fprintf(pp, " 0=%d", op_type);
         }
+        else if (op == "Normalize")
+        {
+            float eps = get_node_attr_f(node, "eps", 0.f);
+            int scale_data_size = 1;
+
+            fprintf(pp, " 1=1");// channel_shared
+            fprintf(pp, " 2=%e", eps);
+            fprintf(pp, " 3=%d", scale_data_size);
+            fprintf(pp, " 9=1");// TODO hardcode pytorch style
+
+            const float scale_data[1] = { 1.f };
+            fwrite(scale_data, sizeof(float), 1, bp);
+        }
         else if (op == "Pad")
         {
             std::string mode = get_node_attr_s(node, "mode");
-            std::vector<int> pads = get_node_attr_ai(node, "pads");
             float value = get_node_attr_f(node, "value", 0.f);
+
+            std::vector<int> pads;
+            if (node.input_size() == 1)
+            {
+                pads = get_node_attr_ai(node, "pads");
+            }
+            else
+            {
+                pads = get_node_attr_from_input_ai(weights[node.input(1)]);
+            }
 
             int type = 0;
             if (mode == "constant")
@@ -1509,12 +2610,17 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             fprintf(pp, " 2=%d", left);
             fprintf(pp, " 3=%d", right);
             fprintf(pp, " 4=%d", type);
-            fprintf(pp, " 5=%f", value);
+            fprintf(pp, " 5=%e", value);
         }
         else if (op == "Pow")
         {
             int op_type = 6;
             fprintf(pp, " 0=%d", op_type);
+        }
+        else if (op == "PixelShuffle")
+        {
+            int scale_factor = get_node_attr_i(node, "scale_factor", 1);
+            fprintf(pp, " 0=%d", scale_factor);
         }
         else if (op == "PRelu")
         {
@@ -1531,6 +2637,55 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int op_type = 15;
             fprintf(pp, " 0=%d", op_type);
         }
+        else if (op == "ReduceMax" || op == "ReduceMin" || op == "ReduceMean" ||
+                op == "ReduceProd" || op == "ReduceSum" || op == "ReduceSumSquare" ||
+                op == "ReduceL1" || op == "ReduceL2" || op == "ReduceLogSum" || op == "ReduceLogSumExp")
+        {
+            int op_type = -233;
+            if (op == "ReduceSum")
+                op_type = 0;
+            else if (op == "ReduceSumSquare")
+                op_type = 2;
+            else if (op == "ReduceMean")
+                op_type = 3;
+            else if (op == "ReduceMax")
+                op_type = 4;
+            else if (op == "ReduceMin")
+                op_type = 5;
+            else if (op == "ReduceProd")
+                op_type = 6;
+            else if (op == "ReduceL1")
+                op_type = 7;
+            else if (op == "ReduceL2")
+                op_type = 8;
+            else if (op == "ReduceLogSum")
+                op_type = 9;
+            else if (op == "ReduceLogSumExp")
+                op_type = 10;
+            fprintf(pp, " 0=%d", op_type);
+
+            std::vector<int> axes = get_node_attr_ai(node, "axes");
+            int keepdims = get_node_attr_i(node, "keepdims", 1);
+
+            if (axes.size() > 0)
+            {
+                // if axes set, reduce according to axes
+                fprintf(pp, " 1=%d", 0);
+                fprintf(pp, " -23303=%zu", axes.size());
+                for (int i=0; i< axes.size(); i++)
+                {
+                    if (axes[i] == 0 || axes[i] > 3 || axes[i] < -3)
+                        fprintf(stderr, "Unsupported reduction axes !\n");
+                    fprintf(pp, ",%d", axes[i]);
+                }
+            }
+            else
+            {
+                // if axes not set, reduce all axes by default
+                fprintf(pp, " 1=%d", 1);
+            }
+            fprintf(pp, " 4=%d", keepdims);
+        }
         else if (op == "Reshape")
         {
             std::vector<int> shape;
@@ -1541,7 +2696,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
             else
             {
-                shape = get_tensor_proto_reshape_shape(weights[node.input(1)]);
+                shape = get_node_attr_from_input_ai(weights[node.input(1)]);
             }
 
             if (shape.size() == 1) {
@@ -1561,6 +2716,94 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 fprintf(pp, " 2=%d", shape[1]);
             }
         }
+        else if (op == "Resize")
+        {
+            std::string mode = get_node_attr_s(node, "mode");
+
+            std::vector<float> scales;
+            {
+                const onnx::TensorProto& scales_tp = weights[node.input(2)];
+                const float* shape_data = scales_tp.has_raw_data() ? (const float*)scales_tp.raw_data().data() : scales_tp.float_data().data();
+
+                int float_data_size = scales_tp.float_data_size();
+                //float data is None, use raw data instead
+                if (float_data_size == 0) {
+                    float_data_size = scales_tp.dims().Get(0);
+                }
+
+                for (int j=0; j<float_data_size; j++)
+                {
+                    scales.push_back(shape_data[j]);
+                }
+            }
+
+            std::vector<int> sizes;
+            {
+                sizes = get_node_attr_from_input_ai(weights[node.input(3)]);
+            }
+
+            int resize_type = 1;
+            if (mode == "nearest")
+            {
+                resize_type = 1;
+            }
+            else if (mode == "linear")
+            {
+                resize_type = 2;
+            }
+            else if (mode == "cubic")
+            {
+                resize_type = 3;
+            }
+
+            if (scales.empty() && sizes.empty())
+            {
+                fprintf(stderr, "Unsupported Resize scales and sizes are all empty!\n");
+            }
+
+            float h_scale = 1.f;
+            float w_scale = 1.f;
+            if (scales.size() == 2)
+            {
+                w_scale = scales[1];
+            }
+            else if (scales.size() == 3)
+            {
+                h_scale = scales[1];
+                w_scale = scales[2];
+            }
+            else if (scales.size() == 4)
+            {
+                h_scale = scales[2];
+                w_scale = scales[3];
+
+                if (scales[1] != 1.f)
+                    fprintf(stderr, "Unsupported Resize scales !\n");
+            }
+
+            int output_height = 0;
+            int output_width = 0;
+            if (sizes.size() == 2)
+            {
+                output_width = sizes[1];
+            }
+            else if (sizes.size() == 3)
+            {
+                output_height = sizes[1];
+                output_width = sizes[2];
+            }
+            else if (sizes.size() == 4)
+            {
+                output_height = sizes[2];
+                output_width = sizes[3];
+            }
+
+            fprintf(pp, " 0=%d", resize_type);
+            fprintf(pp, " 1=%e", h_scale);
+            fprintf(pp, " 2=%e", w_scale);
+            fprintf(pp, " 3=%d", output_height);
+            fprintf(pp, " 4=%d", output_width);
+        }
         else if (op == "ShuffleChannel")
         {
             int group = get_node_attr_i(node, "group", 1);
@@ -1576,9 +2819,24 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         }
         else if (op == "Slice")
         {
-            std::vector<int> starts = get_node_attr_ai(node, "starts");
-            std::vector<int> ends = get_node_attr_ai(node, "ends");
-            std::vector<int> steps = get_node_attr_ai(node, "steps");// TODO
+            std::vector<int> starts;
+            std::vector<int> ends;
+            std::vector<int> axes;
+            std::vector<int> steps;
+            if (node.input_size() == 1)
+            {
+                starts = get_node_attr_ai(node, "starts");
+                ends = get_node_attr_ai(node, "ends");
+                axes = get_node_attr_ai(node, "axes");
+                steps = get_node_attr_ai(node, "steps");// TODO
+            }
+            else
+            {
+                starts = get_node_attr_from_input_ai(weights[node.input(1)]);
+                ends = get_node_attr_from_input_ai(weights[node.input(2)]);
+                axes = get_node_attr_from_input_ai(weights[node.input(3)]);
+                steps = get_node_attr_from_input_ai(weights[node.input(4)]);
+            }
 
             // assert step == 1
             for (int i=0; i<(int)steps.size(); i++)
@@ -1589,51 +2847,47 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 }
             }
 
-            int woffset = 0;
-            int hoffset = 0;
-            int coffset = 0;
-            int outw = -233;
-            int outh = -233;
-            int outc = -233;
-
-            if (starts.size() == 1) 
+            // filter out N-dim axis
+            if (!axes.empty())
             {
-                woffset = starts[0];
-                hoffset = -233;
-                coffset = -233;
-                outw = ends[0] == -1 ? -233: ends[0] - starts[0]; // for onnx from pytorch, -233 works
-            } 
-            else if (starts.size() == 2)
-            {
-                woffset = starts[1];
-                hoffset = -233;
-                coffset = -233;
-                outw = ends[1] == -1 ? -233 : ends[1] - starts[1];
-            }
-            else if (starts.size() == 3)
-            {
-                woffset = starts[2];
-                hoffset = starts[1];
-                coffset = -233;
-                outw = ends[2] == -1 ? -233 : ends[2] - starts[2];
-                outh = ends[1] == -1 ? -233 : ends[1] - starts[1];
-            }
-            else if (starts.size() == 4)
-            {
-                woffset = starts[3];
-                hoffset = starts[2];
-                coffset = starts[1];
-                outw = ends[3] == -1 ? -233 : ends[3] - starts[3];
-                outh = ends[2] == -1 ? -233 : ends[2] - starts[2];
-                outc = ends[1] == -1 ? -233 : ends[1] - starts[1];
+                for (int i=0; i<(int)axes.size(); i++)
+                {
+                    int axis = axes[i];
+                    if (axis == 0)
+                    {
+                        starts.erase(starts.begin() + i);
+                        ends.erase(ends.begin() + i);
+                        axes.erase(axes.begin() + i);
+                        break;
+                    }
+                }
             }
 
-            fprintf(pp, " 0=%d", woffset);
-            fprintf(pp, " 1=%d", hoffset);
-            fprintf(pp, " 2=%d", coffset);
-            fprintf(pp, " 3=%d", outw);
-            fprintf(pp, " 4=%d", outh);
-            fprintf(pp, " 5=%d", outc);
+            fprintf(pp, " -23309=%d", (int)starts.size());
+            for (int i=0; i<(int)starts.size(); i++)
+            {
+                fprintf(pp, ",%d", starts[i]);
+            }
+            fprintf(pp, " -23310=%d", (int)ends.size());
+            for (int i=0; i<(int)ends.size(); i++)
+            {
+                fprintf(pp, ",%d", ends[i]);
+            }
+            if (!axes.empty())
+            {
+                fprintf(pp, " -23311=%d", (int)axes.size());
+                for (int i=0; i<(int)axes.size(); i++)
+                {
+                    int axis = axes[i];
+                    if (axis == 0 || axis > 3 || axis < -3)
+                        fprintf(stderr, "Unsupported slice axes !\n");
+
+                    if (axis > 0)
+                        axis = axis - 1;// -1 for skip N-dim
+
+                    fprintf(pp, ",%d", axis);
+                }
+            }
         }
         else if (op == "Softmax")
         {
@@ -1641,10 +2895,56 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             fprintf(pp, " 0=%d", axis-1);
             fprintf(pp, " 1=1");
         }
+        else if (op == "Split")
+        {
+            int axis = get_node_attr_i(node, "axis", 0);
+            std::vector<int> split = get_node_attr_ai(node, "split");
+            if (axis < 1)
+                fprintf(stderr, "Unsupported split axis !\n");
+
+            fprintf(pp, " -23300=%d", output_size);
+            if (split.empty())
+            {
+                for (int i=0; i<output_size; i++)
+                {
+                    fprintf(pp, ",-233");
+                }
+            }
+            else
+            {
+                for (int i=0; i<split.size() - 1; i++)
+                {
+                    fprintf(pp, ",%d", split[i]);
+                }
+                fprintf(pp, ",-233");
+            }
+            fprintf(pp, " 1=%d", axis - 1);
+        }
         else if (op == "Sqrt")
         {
             int op_type = 5;
             fprintf(pp, " 0=%d", op_type);
+        }
+        else if (op == "Squeeze")
+        {
+            std::vector<int> axes = get_node_attr_ai(node, "axes");
+
+            if (axes.empty())
+            {
+                fprintf(pp, " 0=1");
+                fprintf(pp, " 1=1");
+                fprintf(pp, " 2=1");
+            }
+            else
+            {
+                fprintf(pp, " -23303=%zu", axes.size());
+                for (int i=0; i<(int)axes.size(); i++)
+                {
+                    if (axes[i] == 0 || axes[i] > 3 || axes[i] < -3)
+                        fprintf(stderr, "Unsupported squeeze axes !\n");
+                    fprintf(pp, ",%d", axes[i]);
+                }
+            }
         }
         else if (op == "Sub")
         {
@@ -1700,7 +3000,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                     return tl::make_unexpected( "Unsupported transpose type !");
             }
         }
-        else if (op == "Upsample" || op == "Resize")
+        else if (op == "Upsample")
         {
             std::string mode = get_node_attr_s(node, "mode");
 
@@ -1714,7 +3014,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             {
                 const onnx::TensorProto& scales_tp = weights[node.input(1)];
                 const float* shape_data = scales_tp.has_raw_data() ? (const float*)scales_tp.raw_data().data() : scales_tp.float_data().data();
-                
+
                 int float_data_size = scales_tp.float_data_size();
                 //float data is None, use raw data instead
                 if (float_data_size == 0) {
@@ -1738,7 +3038,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
             else if (mode == "trilinear")
             {
-                return tl::make_unexpected("Unsupported Upsample/Resize mode !");
+                fprintf(stderr, "Unsupported Upsample mode !\n");
             }
 
             float h_scale = 1.f;
@@ -1758,16 +3058,28 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 w_scale = scales[3];
 
                 if (scales[1] != 1.f)
-                    return tl::make_unexpected("Unsupported Upsample/Resize scales !");
+                    fprintf(stderr, "Unsupported Upsample scales !\n");
             }
             else
             {
-                return tl::make_unexpected("Unsupported Upsample/Resize scales !");
+                fprintf(stderr, "Unsupported Upsample scales !\n");
             }
 
             fprintf(pp, " 0=%d", resize_type);
-            fprintf(pp, " 1=%f", h_scale);
-            fprintf(pp, " 2=%f", w_scale);
+            fprintf(pp, " 1=%e", h_scale);
+            fprintf(pp, " 2=%e", w_scale);
+        }
+        else if (op == "Unsqueeze")
+        {
+            std::vector<int> axes = get_node_attr_ai(node, "axes");
+
+            fprintf(pp, " -23303=%zu", axes.size());
+            for (int i=0; i<(int)axes.size(); i++)
+            {
+                if (axes[i] == 0 || axes[i] > 4 || axes[i] < -4)
+                    fprintf(stderr, "Unsupported unsqueeze axes !\n");
+                fprintf(pp, ",%d", axes[i]);
+            }
         }
         else
         {
@@ -1777,7 +3089,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 const onnx::AttributeProto& attr = node.attribute(j);
                 if (attr.type() == 1)
                 {
-                    fprintf(stderr, "  # %s=%f\n", attr.name().c_str(), attr.f());
+                    fprintf(stderr, "  # %s=%g\n", attr.name().c_str(), attr.f());
                 }
                 else if (attr.type() == 2)
                 {

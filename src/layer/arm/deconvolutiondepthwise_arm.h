@@ -30,15 +30,11 @@ public:
     virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
 public:
-    Layer* activation;
     std::vector<ncnn::Layer*> group_ops;
 
     // packing
     Mat weight_data_pack4;
-
-    Mat weight_data_pack4_groups;
-    Mat weight_data_pack1to4_groups;
-    Mat weight_data_pack4to1_groups;
+    Mat weight_data_pack1;
 };
 
 } // namespace ncnn

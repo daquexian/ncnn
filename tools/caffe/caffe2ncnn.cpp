@@ -12,11 +12,15 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_DEPRECATE
+#endif
+
 #include "caffe2ncnn.h"
 
-#include <cstdio>
-#include <climits>
-#include <cmath>
+#include <stdio.h>
+#include <limits.h>
+#include <math.h>
 
 #include <fstream>
 #include <set>
@@ -37,7 +41,7 @@
 
 static inline size_t alignSize(size_t sz, int n)
 {
-    return (sz + n-1) & -n;
+    return (sz + n - 1) & -n;
 }
 
 // convert float to half precision floating point
@@ -57,9 +61,9 @@ static unsigned short float2half(float value)
     unsigned short exponent = (tmp.u & 0x7F800000) >> 23;
     unsigned int significand = tmp.u & 0x7FFFFF;
 
-//     fprintf(stderr, "%d %d %d\n", sign, exponent, significand);
+    //     fprintf(stderr, "%d %d %d\n", sign, exponent, significand);
 
-    // 1 : 5 : 10
+        // 1 : 5 : 10
     unsigned short fp16;
     if (exponent == 0)
     {
@@ -74,7 +78,7 @@ static unsigned short float2half(float value)
     else
     {
         // normalized
-        short newexp = exponent + (- 127 + 15);
+        short newexp = exponent + (-127 + 15);
         if (newexp >= 31)
         {
             // overflow, return infinity
@@ -108,15 +112,15 @@ static unsigned short float2half(float value)
 static signed char float2int8(float value)
 {
     float tmp;
-    if (value >= 0.f) tmp = value + 0.5;
-    else tmp = value - 0.5;
+    if (value >= 0.f) tmp = value + 0.5f;
+    else tmp = value - 0.5f;
 
     if (tmp > 127)
         return 127;
-    if (tmp < -128)
-        return -128;
+    if (tmp < -127)
+        return -127;
 
-    return tmp;
+    return static_cast<signed char>(tmp);
 }
 
 static bool read_int8scale_table(const char* filepath, std::map<std::string, std::vector<float> >& blob_int8scale_table, std::map<std::string, std::vector<float> >& weight_int8scale_table)
@@ -159,11 +163,11 @@ static bool read_int8scale_table(const char* filepath, std::map<std::string, std
                 // XYZ_param_N pattern
                 if (strstr(keystr.c_str(), "_param_"))
                 {
-                    weight_int8scale_table[ keystr ] = scales;
+                    weight_int8scale_table[keystr] = scales;
                 }
                 else
                 {
-                    blob_int8scale_table[ keystr ] = scales;
+                    blob_int8scale_table[keystr] = scales;
                 }
 
                 keystr.clear();
@@ -186,11 +190,11 @@ static bool read_int8scale_table(const char* filepath, std::map<std::string, std
         // XYZ_param_N pattern
         if (strstr(keystr.c_str(), "_param_"))
         {
-            weight_int8scale_table[ keystr ] = scales;
+            weight_int8scale_table[keystr] = scales;
         }
         else
         {
-            blob_int8scale_table[ keystr ] = scales;
+            blob_int8scale_table[keystr] = scales;
         }
     }
 
@@ -220,13 +224,13 @@ static int quantize_weight(float *data, size_t data_length, std::vector<float> s
 {
     int8_weights.resize(data_length);
 
-    int length_per_group = data_length / scales.size();
+    const int length_per_group = static_cast<int>(data_length / scales.size());
 
     for (size_t i = 0; i < data_length; i++)
     {
         float f = data[i];
 
-        signed char int8 = float2int8(f * scales[ i / length_per_group ]);
+        signed char int8 = float2int8(f * scales[i / length_per_group]);
 
         int8_weights[i] = int8;
     }
@@ -269,17 +273,17 @@ static bool quantize_weight(float *data, size_t data_length, int quantize_level,
     // 3. Align data to the quantized value
     for (size_t i = 0; i < data_length; ++i)
     {
-        size_t table_index = int((data[i] - min_value) / strides);
-        table_index = std::min<float>(table_index, quantize_level - 1);
+        int table_index = int((data[i] - min_value) / strides);
+        table_index = std::min(table_index, quantize_level - 1);
 
-        float low_value  = quantize_table[table_index];
+        float low_value = quantize_table[table_index];
         float high_value = low_value + strides;
 
         // find a nearest value between low and high value.
-        float targetValue = data[i] - low_value < high_value - data[i] ? low_value : high_value;
+        const float targetValue = data[i] - low_value < high_value - data[i] ? low_value : high_value;
 
         table_index = int((targetValue - min_value) / strides);
-        table_index = std::min<float>(table_index, quantize_level - 1);
+        table_index = std::min(table_index, quantize_level - 1);
         quantize_index.push_back(table_index);
     }
 
@@ -342,11 +346,11 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     // [layer count] [blob count]
     int layer_count = proto.layer_size();
     std::set<std::string> blob_names;
-    for (int i=0; i<layer_count; i++)
+    for (int i = 0; i < layer_count; i++)
     {
         const caffe_ncnn::LayerParameter& layer = proto.layer(i);
 
-        for (int j=0; j<layer.bottom_size(); j++)
+        for (int j = 0; j < layer.bottom_size(); j++)
         {
             std::string blob_name = layer.bottom(j);
             if (blob_name_decorated.find(blob_name) != blob_name_decorated.end())
@@ -374,7 +378,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
         else
         {
-            for (int j=0; j<layer.top_size(); j++)
+            for (int j = 0; j < layer.top_size(); j++)
             {
                 std::string blob_name = layer.top(j);
                 blob_names.insert(blob_name);
@@ -393,16 +397,16 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         else
         {
             splitncnn_blob_count += it->second;
-//             fprintf(stderr, "%s %d\n", it->first.c_str(), it->second);
+            //             fprintf(stderr, "%s %d\n", it->first.c_str(), it->second);
             ++it;
         }
     }
-    fprintf(pp, "%lu %lu\n", layer_count + bottom_reference.size(), blob_names.size() + splitncnn_blob_count);
+    fprintf(pp, "%d %d\n", int(layer_count + bottom_reference.size()), int(blob_names.size() + splitncnn_blob_count));
 
     // populate
     blob_name_decorated.clear();
     int internal_split = 0;
-    for (int i=0; i<layer_count; i++)
+    for (int i = 0; i < layer_count; i++)
     {
         const caffe_ncnn::LayerParameter& layer = proto.layer(i);
 
@@ -449,13 +453,17 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         {
             fprintf(pp, "%-16s", "Clip");
         }
+        else if (layer.type() == "Silence")
+        {
+            fprintf(pp, "%-16s", "Noop");
+        }
         else
         {
             fprintf(pp, "%-16s", layer.type().c_str());
         }
         fprintf(pp, " %-16s %d %d", layer.name().c_str(), layer.bottom_size(), layer.top_size());
 
-        for (int j=0; j<layer.bottom_size(); j++)
+        for (int j = 0; j < layer.bottom_size(); j++)
         {
             std::string blob_name = layer.bottom(j);
             if (blob_name_decorated.find(layer.bottom(j)) != blob_name_decorated.end())
@@ -486,7 +494,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
         else
         {
-            for (int j=0; j<layer.top_size(); j++)
+            for (int j = 0; j < layer.top_size(); j++)
             {
                 std::string blob_name = layer.top(j);
                 fprintf(pp, " %s", blob_name.c_str());
@@ -495,7 +503,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
 
         // find blob binary by layer name
         int netidx;
-        for (netidx=0; netidx<net.layer_size(); netidx++)
+        for (netidx = 0; netidx < net.layer_size(); netidx++)
         {
             if (net.layer(netidx).name() == layer.name())
             {
@@ -522,7 +530,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             {
                 fwrite(mean_blob.data().data(), sizeof(float), mean_blob.data_size(), bp);
                 float tmp;
-                for (int j=0; j<var_blob.data_size(); j++)
+                for (int j = 0; j < var_blob.data_size(); j++)
                 {
                     tmp = var_blob.data().data()[j] + eps;
                     fwrite(&tmp, sizeof(float), 1, bp);
@@ -533,12 +541,12 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                 float scale_factor = binlayer.blobs(2).data().data()[0] == 0 ? 0 : 1 / binlayer.blobs(2).data().data()[0];
                 // premultiply scale_factor to mean and variance
                 float tmp;
-                for (int j=0; j<mean_blob.data_size(); j++)
+                for (int j = 0; j < mean_blob.data_size(); j++)
                 {
                     tmp = mean_blob.data().data()[j] * scale_factor;
                     fwrite(&tmp, sizeof(float), 1, bp);
                 }
-                for (int j=0; j<var_blob.data_size(); j++)
+                for (int j = 0; j < var_blob.data_size(); j++)
                 {
                     tmp = var_blob.data().data()[j] * scale_factor + eps;
                     fwrite(&tmp, sizeof(float), 1, bp);
@@ -562,9 +570,9 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
         else if (layer.type() == "Concat")
         {
-            const caffe_ncnn::ConcatParameter& concat_param = layer.concat_param();
-            int dim = concat_param.axis() - 1;
-            fprintf(pp, " 0=%d", dim);
+            const caffe::ConcatParameter& concat_param = layer.concat_param();
+            int axis = concat_param.axis() - 1;
+            fprintf(pp, " 0=%d", axis);
         }
         else if (layer.type() == "Convolution" || layer.type() == "ConvolutionDepthwise" || layer.type() == "DepthwiseConvolution")
         {
@@ -717,8 +725,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
 
                         // padding to 32bit align
                         int nwrite = ftell(bp) - p0;
-                        int nalign = alignSize(nwrite, 4);
-                        unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+                        int nalign = int(alignSize(nwrite, 4));
+                        unsigned char padding[4] = { 0x00, 0x00, 0x00, 0x00 };
                         fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
                     }
                     else
@@ -748,19 +756,19 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             if (num_offset == 1)
             {
                 int offset = crop_param.offset(0);
-                int axis = crop_param.axis();
-                if (axis == 1)
+                int axis = crop_param.axis() - 1;
+                if (axis == 0)
                 {
                     fprintf(pp, " 0=%d", offset);
                     fprintf(pp, " 1=%d", offset);
                     fprintf(pp, " 2=%d", offset);
                 }
-                else if (axis == 2)
+                else if (axis == 1)
                 {
                     fprintf(pp, " 0=%d", offset);
                     fprintf(pp, " 1=%d", offset);
                 }
-                else if (axis == 3)
+                else if (axis == 2)
                 {
                     fprintf(pp, " 0=%d", offset);
                 }
@@ -838,22 +846,22 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             {
                 maxk = convolution_param.kernel_size(0) * convolution_param.kernel_size(0);
             }
-            for (int g=0; g<group; g++)
+            for (int g = 0; g < group; g++)
             {
-            // reorder weight from inch-outch to outch-inch
-            int num_output = convolution_param.num_output() / group;
-            int num_input = weight_blob.data_size() / maxk / num_output / group;
-            const float* weight_data_ptr = weight_blob.data().data() + g * maxk * num_output * num_input;
-            for (int k=0; k<num_output; k++)
-            {
-                for (int j=0; j<num_input; j++)
+                // reorder weight from inch-outch to outch-inch
+                int num_output = convolution_param.num_output() / group;
+                int num_input = weight_blob.data_size() / maxk / num_output / group;
+                const float* weight_data_ptr = weight_blob.data().data() + g * maxk * num_output * num_input;
+                for (int k = 0; k < num_output; k++)
                 {
-                    fwrite(weight_data_ptr + (j*num_output + k) * maxk, sizeof(float), maxk, bp);
+                    for (int j = 0; j < num_input; j++)
+                    {
+                        fwrite(weight_data_ptr + (j*num_output + k) * maxk, sizeof(float), maxk, bp);
+                    }
                 }
             }
-            }
 
-            for (int j=1; j<binlayer.blobs_size(); j++)
+            for (int j = 1; j < binlayer.blobs_size(); j++)
             {
                 const caffe_ncnn::BlobProto& blob = binlayer.blobs(j);
                 fwrite(blob.data().data(), sizeof(float), blob.data_size(), bp);
@@ -864,10 +872,10 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::DetectionOutputParameter& detection_output_param = layer.detection_output_param();
             const caffe_ncnn::NonMaximumSuppressionParameter& nms_param = detection_output_param.nms_param();
             fprintf(pp, " 0=%d", detection_output_param.num_classes());
-            fprintf(pp, " 1=%f", nms_param.nms_threshold());
+            fprintf(pp, " 1=%e", nms_param.nms_threshold());
             fprintf(pp, " 2=%d", nms_param.top_k());
             fprintf(pp, " 3=%d", detection_output_param.keep_top_k());
-            fprintf(pp, " 4=%f", detection_output_param.confidence_threshold());
+            fprintf(pp, " 4=%e", detection_output_param.confidence_threshold());
         }
         else if (layer.type() == "Dropout")
         {
@@ -875,7 +883,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             if (dropout_param.has_scale_train() && !dropout_param.scale_train())
             {
                 float scale = 1.f - dropout_param.dropout_ratio();
-                fprintf(pp, " 0=%f", scale);
+                fprintf(pp, " 0=%e", scale);
             }
         }
         else if (layer.type() == "Eltwise")
@@ -884,15 +892,15 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             int coeff_size = eltwise_param.coeff_size();
             fprintf(pp, " 0=%d", (int)eltwise_param.operation());
             fprintf(pp, " -23301=%d", coeff_size);
-            for (int j=0; j<coeff_size; j++)
+            for (int j = 0; j < coeff_size; j++)
             {
-                fprintf(pp, ",%f", eltwise_param.coeff(j));
+                fprintf(pp, ",%e", eltwise_param.coeff(j));
             }
         }
         else if (layer.type() == "ELU")
         {
-            const caffe_ncnn::ELUParameter& elu_param = layer.elu_param();
-            fprintf(pp, " 0=%f", elu_param.alpha());
+            const caffe::ELUParameter& elu_param = layer.elu_param();
+            fprintf(pp, " 0=%e", elu_param.alpha());
         }
         else if (layer.type() == "Embed")
         {
@@ -905,7 +913,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             fprintf(pp, " 2=%d", embed_param.bias_term());
             fprintf(pp, " 3=%d", weight_blob.data_size());
 
-            for (int j=0; j<binlayer.blobs_size(); j++)
+            for (int j = 0; j < binlayer.blobs_size(); j++)
             {
                 int quantize_tag = 0;
                 const caffe_ncnn::BlobProto& blob = binlayer.blobs(j);
@@ -947,8 +955,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                     }
                     // padding to 32bit align
                     int nwrite = ftell(bp) - p0;
-                    int nalign = alignSize(nwrite, 4);
-                    unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+                    int nalign = int(alignSize(nwrite, 4));
+                    unsigned char padding[4] = { 0x00, 0x00, 0x00, 0x00 };
                     fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
                 }
                 else
@@ -994,7 +1002,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                 }
             }
 
-            for (int j=0; j<binlayer.blobs_size(); j++)
+            for (int j = 0; j < binlayer.blobs_size(); j++)
             {
                 int quantize_tag = 0;
                 const caffe_ncnn::BlobProto& blob = binlayer.blobs(j);
@@ -1059,8 +1067,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
 
                         // padding to 32bit align
                         int nwrite = ftell(bp) - p0;
-                        int nalign = alignSize(nwrite, 4);
-                        unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+                        int nalign = int(alignSize(nwrite, 4));
+                        unsigned char padding[4] = { 0x00, 0x00, 0x00, 0x00 };
                         fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
                     }
                     else
@@ -1089,19 +1097,19 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::BlobShape& bs = input_param.shape(0);
             if (bs.dim_size() == 4)
             {
-                fprintf(pp, " 0=%ld", bs.dim(3));
-                fprintf(pp, " 1=%ld", bs.dim(2));
-                fprintf(pp, " 2=%ld", bs.dim(1));
+                fprintf(pp, " 0=%zd", size_t(bs.dim(3)));
+                fprintf(pp, " 1=%zd", size_t(bs.dim(2)));
+                fprintf(pp, " 2=%zd", size_t(bs.dim(1)));
             }
             else if (bs.dim_size() == 3)
             {
-                fprintf(pp, " 0=%ld", bs.dim(2));
-                fprintf(pp, " 1=%ld", bs.dim(1));
+                fprintf(pp, " 0=%zd", size_t(bs.dim(2)));
+                fprintf(pp, " 1=%zd", size_t(bs.dim(1)));
                 fprintf(pp, " 2=-233");
             }
             else if (bs.dim_size() == 2)
             {
-                fprintf(pp, " 0=%ld", bs.dim(1));
+                fprintf(pp, " 0=%zd", size_t(bs.dim(1)));
                 fprintf(pp, " 1=-233");
                 fprintf(pp, " 2=-233");
             }
@@ -1110,8 +1118,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         {
             const caffe_ncnn::InterpParameter& interp_param = layer.interp_param();
             fprintf(pp, " 0=%d", 2);
-            fprintf(pp, " 1=%f", (float)interp_param.zoom_factor());
-            fprintf(pp, " 2=%f", (float)interp_param.zoom_factor());
+            fprintf(pp, " 1=%e", (float)interp_param.zoom_factor());
+            fprintf(pp, " 2=%e", (float)interp_param.zoom_factor());
             fprintf(pp, " 3=%d", interp_param.height());
             fprintf(pp, " 4=%d", interp_param.width());
         }
@@ -1120,8 +1128,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::LRNParameter& lrn_param = layer.lrn_param();
             fprintf(pp, " 0=%d", lrn_param.norm_region());
             fprintf(pp, " 1=%d", lrn_param.local_size());
-            fprintf(pp, " 2=%f", lrn_param.alpha());
-            fprintf(pp, " 3=%f", lrn_param.beta());
+            fprintf(pp, " 2=%e", lrn_param.alpha());
+            fprintf(pp, " 3=%e", lrn_param.beta());
         }
         else if (layer.type() == "LSTM")
         {
@@ -1132,7 +1140,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             fprintf(pp, " 0=%d", recurrent_param.num_output());
             fprintf(pp, " 1=%d", weight_blob.data_size());
 
-            for (int j=0; j<binlayer.blobs_size(); j++)
+            for (int j = 0; j < binlayer.blobs_size(); j++)
             {
                 int quantize_tag = 0;
                 const caffe_ncnn::BlobProto& blob = binlayer.blobs(j);
@@ -1172,8 +1180,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                     }
                     // padding to 32bit align
                     int nwrite = ftell(bp) - p0;
-                    int nalign = alignSize(nwrite, 4);
-                    unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+                    int nalign = int(alignSize(nwrite, 4));
+                    unsigned char padding[4] = { 0x00, 0x00, 0x00, 0x00 };
                     fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
                 }
                 else
@@ -1195,7 +1203,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::MVNParameter& mvn_param = layer.mvn_param();
             fprintf(pp, " 0=%d", mvn_param.normalize_variance());
             fprintf(pp, " 1=%d", mvn_param.across_channels());
-            fprintf(pp, " 2=%f", mvn_param.eps());
+            fprintf(pp, " 2=%e", mvn_param.eps());
         }
         else if (layer.type() == "Normalize")
         {
@@ -1204,7 +1212,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::NormalizeParameter& norm_param = layer.norm_param();
             fprintf(pp, " 0=%d", norm_param.across_spatial());
             fprintf(pp, " 1=%d", norm_param.channel_shared());
-            fprintf(pp, " 2=%f", norm_param.eps());
+            fprintf(pp, " 2=%e", norm_param.eps());
             fprintf(pp, " 3=%d", scale_blob.data_size());
 
             fwrite(scale_blob.data().data(), sizeof(float), scale_blob.data_size(), bp);
@@ -1306,10 +1314,10 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
         else if (layer.type() == "Power")
         {
-            const caffe_ncnn::PowerParameter& power_param = layer.power_param();
-            fprintf(pp, " 0=%f", power_param.power());
-            fprintf(pp, " 1=%f", power_param.scale());
-            fprintf(pp, " 2=%f", power_param.shift());
+            const caffe::PowerParameter& power_param = layer.power_param();
+            fprintf(pp, " 0=%e", power_param.power());
+            fprintf(pp, " 1=%e", power_param.scale());
+            fprintf(pp, " 2=%e", power_param.shift());
         }
         else if (layer.type() == "PReLU")
         {
@@ -1323,7 +1331,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::PriorBoxParameter& prior_box_param = layer.prior_box_param();
 
             int num_aspect_ratio = prior_box_param.aspect_ratio_size();
-            for (int j=0; j<prior_box_param.aspect_ratio_size(); j++)
+            for (int j = 0; j < prior_box_param.aspect_ratio_size(); j++)
             {
                 float ar = prior_box_param.aspect_ratio(j);
                 if (fabs(ar - 1.) < 1e-6) {
@@ -1331,7 +1339,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                 }
             }
 
-            float variances[4] = {0.1f, 0.1f, 0.1f, 0.1f};
+            float variances[4] = { 0.1f, 0.1f, 0.1f, 0.1f };
             if (prior_box_param.variance_size() == 4)
             {
                 variances[0] = prior_box_param.variance(0);
@@ -1376,42 +1384,42 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             }
 
             fprintf(pp, " -23300=%d", prior_box_param.min_size_size());
-            for (int j=0; j<prior_box_param.min_size_size(); j++)
+            for (int j = 0; j < prior_box_param.min_size_size(); j++)
             {
-                fprintf(pp, ",%f", prior_box_param.min_size(j));
+                fprintf(pp, ",%e", prior_box_param.min_size(j));
             }
             fprintf(pp, " -23301=%d", prior_box_param.max_size_size());
-            for (int j=0; j<prior_box_param.max_size_size(); j++)
+            for (int j = 0; j < prior_box_param.max_size_size(); j++)
             {
-                fprintf(pp, ",%f", prior_box_param.max_size(j));
+                fprintf(pp, ",%e", prior_box_param.max_size(j));
             }
             fprintf(pp, " -23302=%d", num_aspect_ratio);
-            for (int j=0; j<prior_box_param.aspect_ratio_size(); j++)
+            for (int j = 0; j < prior_box_param.aspect_ratio_size(); j++)
             {
                 float ar = prior_box_param.aspect_ratio(j);
                 if (fabs(ar - 1.) < 1e-6) {
                     continue;
                 }
-                fprintf(pp, ",%f", ar);
+                fprintf(pp, ",%e", ar);
             }
-            fprintf(pp, " 3=%f", variances[0]);
-            fprintf(pp, " 4=%f", variances[1]);
-            fprintf(pp, " 5=%f", variances[2]);
-            fprintf(pp, " 6=%f", variances[3]);
+            fprintf(pp, " 3=%e", variances[0]);
+            fprintf(pp, " 4=%e", variances[1]);
+            fprintf(pp, " 5=%e", variances[2]);
+            fprintf(pp, " 6=%e", variances[3]);
             fprintf(pp, " 7=%d", flip);
             fprintf(pp, " 8=%d", clip);
             fprintf(pp, " 9=%d", image_width);
             fprintf(pp, " 10=%d", image_height);
-            fprintf(pp, " 11=%f", step_width);
-            fprintf(pp, " 12=%f", step_height);
-            fprintf(pp, " 13=%f", prior_box_param.offset());
+            fprintf(pp, " 11=%e", step_width);
+            fprintf(pp, " 12=%e", step_height);
+            fprintf(pp, " 13=%e", prior_box_param.offset());
         }
         else if (layer.type() == "PSROIPooling")
         {
             const caffe_ncnn::PSROIPoolingParameter& psroi_pooling_param = layer.psroi_pooling_param();
             fprintf(pp, " 0=%d", psroi_pooling_param.group_size());
             fprintf(pp, " 1=%d", psroi_pooling_param.group_size());
-            fprintf(pp, " 2=%f", psroi_pooling_param.spatial_scale());
+            fprintf(pp, " 2=%e", psroi_pooling_param.spatial_scale());
             fprintf(pp, " 3=%d", psroi_pooling_param.output_dim());
         }
         else if (layer.type() == "Python")
@@ -1424,17 +1432,17 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                 sscanf(python_param.param_str().c_str(), "'feat_stride': %d", &feat_stride);
 
                 int base_size = 16;
-//                 float ratio;
-//                 float scale;
+                //                 float ratio;
+                //                 float scale;
                 int pre_nms_topN = 6000;
                 int after_nms_topN = 300;
-                float nms_thresh = 0.7;
+                float nms_thresh = 0.7f;
                 int min_size = 16;
                 fprintf(pp, " 0=%d", feat_stride);
                 fprintf(pp, " 1=%d", base_size);
                 fprintf(pp, " 2=%d", pre_nms_topN);
                 fprintf(pp, " 3=%d", after_nms_topN);
-                fprintf(pp, " 4=%f", nms_thresh);
+                fprintf(pp, " 4=%e", nms_thresh);
                 fprintf(pp, " 5=%d", min_size);
             }
         }
@@ -1443,15 +1451,15 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::ReLUParameter& relu_param = layer.relu_param();
             if (relu_param.has_negative_slope())
             {
-                fprintf(pp, " 0=%f", relu_param.negative_slope());
+                fprintf(pp, " 0=%e", relu_param.negative_slope());
             }
         }
         else if (layer.type() == "ReLU6")
         {
             float min = 0.f;
             float max = 6.f;
-            fprintf(pp, " 0=%f", min);
-            fprintf(pp, " 1=%f", max);
+            fprintf(pp, " 0=%e", min);
+            fprintf(pp, " 1=%e", max);
         }
         else if (layer.type() == "Reorg")
         {
@@ -1464,19 +1472,19 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::BlobShape& bs = reshape_param.shape();
             if (bs.dim_size() == 1)
             {
-                fprintf(pp, " 0=%ld 1=-233 2=-233", bs.dim(0));
+                fprintf(pp, " 0=%zd 1=-233 2=-233", size_t(bs.dim(0)));
             }
             else if (bs.dim_size() == 2)
             {
-                fprintf(pp, " 0=%ld 1=-233 2=-233", bs.dim(1));
+                fprintf(pp, " 0=%zd 1=-233 2=-233", size_t(bs.dim(1)));
             }
             else if (bs.dim_size() == 3)
             {
-                fprintf(pp, " 0=%ld 1=%ld 2=-233", bs.dim(2), bs.dim(1));
+                fprintf(pp, " 0=%zd 1=%zd 2=-233", size_t(bs.dim(2)), bs.dim(1));
             }
             else // bs.dim_size() == 4
             {
-                fprintf(pp, " 0=%ld 1=%ld 2=%ld", bs.dim(3), bs.dim(2), bs.dim(1));
+                fprintf(pp, " 0=%zd 1=%zd 2=%zd", size_t(bs.dim(3)), size_t(bs.dim(2)), size_t(bs.dim(1)));
             }
             fprintf(pp, " 3=0");// permute
         }
@@ -1485,14 +1493,14 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             const caffe_ncnn::ROIAlignParameter& roi_align_param = layer.roi_align_param();
             fprintf(pp, " 0=%d", roi_align_param.pooled_w());
             fprintf(pp, " 1=%d", roi_align_param.pooled_h());
-            fprintf(pp, " 2=%f", roi_align_param.spatial_scale());
+            fprintf(pp, " 2=%e", roi_align_param.spatial_scale());
         }
         else if (layer.type() == "ROIPooling")
         {
             const caffe_ncnn::ROIPoolingParameter& roi_pooling_param = layer.roi_pooling_param();
             fprintf(pp, " 0=%d", roi_pooling_param.pooled_w());
             fprintf(pp, " 1=%d", roi_pooling_param.pooled_h());
-            fprintf(pp, " 2=%f", roi_pooling_param.spatial_scale());
+            fprintf(pp, " 2=%e", roi_pooling_param.spatial_scale());
         }
         else if (layer.type() == "Scale")
         {
@@ -1502,8 +1510,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             bool scale_weight = scale_param.bias_term() ? (binlayer.blobs_size() == 2) : (binlayer.blobs_size() == 1);
             if (scale_weight)
             {
-                const caffe_ncnn::BlobProto& weight_blob = binlayer.blobs(0);
-                fprintf(pp, " 0=%d", (int)weight_blob.data_size());
+                const caffe::BlobProto& weight_blob = binlayer.blobs(0);
+                fprintf(pp, " 0=%d", int(weight_blob.data_size()));
             }
             else
             {
@@ -1512,7 +1520,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
 
             fprintf(pp, " 1=%d", scale_param.bias_term());
 
-            for (int j=0; j<binlayer.blobs_size(); j++)
+            for (int j = 0; j < binlayer.blobs_size(); j++)
             {
                 const caffe_ncnn::BlobProto& blob = binlayer.blobs(j);
                 fwrite(blob.data().data(), sizeof(float), blob.data_size(), bp);
@@ -1530,7 +1538,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             {
                 int num_slice = layer.top_size();
                 fprintf(pp, " -23300=%d", num_slice);
-                for (int j=0; j<num_slice; j++)
+                for (int j = 0; j < num_slice; j++)
                 {
                     fprintf(pp, ",-233");
                 }
@@ -1540,7 +1548,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                 int num_slice = slice_param.slice_point_size() + 1;
                 fprintf(pp, " -23300=%d", num_slice);
                 int prev_offset = 0;
-                for (int j=0; j<slice_param.slice_point_size(); j++)
+                for (int j = 0; j < slice_param.slice_point_size(); j++)
                 {
                     int offset = slice_param.slice_point(j);
                     fprintf(pp, ",%d", offset - prev_offset);
@@ -1548,8 +1556,16 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                 }
                 fprintf(pp, ",-233");
             }
-            int dim = slice_param.axis() - 1;
-            fprintf(pp, " 1=%d", dim);
+            int axis = 0;
+            if (slice_param.has_axis())
+            {
+                axis = slice_param.axis() - 1;
+            }
+            else if (slice_param.has_slice_dim())
+            {
+                axis = slice_param.slice_dim() - 1;
+            }
+            fprintf(pp, " 1=%d", axis);
         }
         else if (layer.type() == "Softmax")
         {
@@ -1560,8 +1576,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
         else if (layer.type() == "Threshold")
         {
-            const caffe_ncnn::ThresholdParameter& threshold_param = layer.threshold_param();
-            fprintf(pp, " 0=%f", threshold_param.threshold());
+            const caffe::ThresholdParameter& threshold_param = layer.threshold_param();
+            fprintf(pp, " 0=%e", threshold_param.threshold());
         }
         else if (layer.type() == "YoloDetectionOutput")
         {
@@ -1569,45 +1585,45 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
 
             fprintf(pp, " 0=%d", yolo_detection_output_param.num_classes());
             fprintf(pp, " 1=%d", yolo_detection_output_param.num_box());
-            fprintf(pp, " 2=%f", yolo_detection_output_param.confidence_threshold());
-            fprintf(pp, " 3=%f", yolo_detection_output_param.nms_threshold());
+            fprintf(pp, " 2=%e", yolo_detection_output_param.confidence_threshold());
+            fprintf(pp, " 3=%e", yolo_detection_output_param.nms_threshold());
 
             int num_bias = yolo_detection_output_param.biases_size();
             fprintf(pp, " -23304=%d", num_bias);
-            for (int j=0; j<num_bias; j++)
+            for (int j = 0; j < num_bias; j++)
             {
-                fprintf(pp, ",%f", yolo_detection_output_param.biases(j));
+                fprintf(pp, ",%e", yolo_detection_output_param.biases(j));
             }
         }
-		else if (layer.type() == "Yolov3DetectionOutput")
-		{
-			const caffe_ncnn::Yolov3DetectionOutputParameter& yolov3_detection_output_param = layer.yolov3_detection_output_param();
+        else if (layer.type() == "Yolov3DetectionOutput")
+        {
+            const caffe::Yolov3DetectionOutputParameter& yolov3_detection_output_param = layer.yolov3_detection_output_param();
 
-			fprintf(pp, " 0=%d", yolov3_detection_output_param.num_classes());
-			fprintf(pp, " 1=%d", yolov3_detection_output_param.num_box());
-			fprintf(pp, " 2=%f", yolov3_detection_output_param.confidence_threshold());
-			fprintf(pp, " 3=%f", yolov3_detection_output_param.nms_threshold());
+            fprintf(pp, " 0=%d", yolov3_detection_output_param.num_classes());
+            fprintf(pp, " 1=%d", yolov3_detection_output_param.num_box());
+            fprintf(pp, " 2=%e", yolov3_detection_output_param.confidence_threshold());
+            fprintf(pp, " 3=%e", yolov3_detection_output_param.nms_threshold());
 
-			int num_bias = yolov3_detection_output_param.biases_size();
-			fprintf(pp, " -23304=%d", num_bias);
-			for (int j = 0; j<num_bias; j++)
-			{
-				fprintf(pp, ",%f", yolov3_detection_output_param.biases(j));
-			}
-			int num_mask = yolov3_detection_output_param.mask_size();
-			fprintf(pp, " -23305=%d", num_mask);
-			for (int j = 0; j<num_mask; j++)
-			{
-				fprintf(pp, ",%f", (float)yolov3_detection_output_param.mask(j));
-			}
-			int num_anchors = yolov3_detection_output_param.anchors_scale_size();
-			fprintf(pp, " -23306=%d", num_anchors);
-			for (int j = 0; j<num_anchors; j++)
-			{
-				fprintf(pp, ",%f", (float)yolov3_detection_output_param.anchors_scale(j));
-			}
-			fprintf(pp, " 7=%d", yolov3_detection_output_param.mask_group_num());
-		}
+            int num_bias = yolov3_detection_output_param.biases_size();
+            fprintf(pp, " -23304=%d", num_bias);
+            for (int j = 0; j < num_bias; j++)
+            {
+                fprintf(pp, ",%e", yolov3_detection_output_param.biases(j));
+            }
+            int num_mask = yolov3_detection_output_param.mask_size();
+            fprintf(pp, " -23305=%d", num_mask);
+            for (int j = 0; j < num_mask; j++)
+            {
+                fprintf(pp, ",%e", (float)yolov3_detection_output_param.mask(j));
+            }
+            int num_anchors = yolov3_detection_output_param.anchors_scale_size();
+            fprintf(pp, " -23306=%d", num_anchors);
+            for (int j = 0; j < num_anchors; j++)
+            {
+                fprintf(pp, ",%e", (float)yolov3_detection_output_param.anchors_scale(j));
+            }
+            fprintf(pp, " 7=%d", yolov3_detection_output_param.mask_group_num());
+        }
         fprintf(pp, "\n");
 
         // add split layer if top reference larger than one
@@ -1624,7 +1640,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                     fprintf(pp, "%-16s %-16s %d %d", "Split", splitname, 1, refcount);
                     fprintf(pp, " %s", blob_name.c_str());
 
-                    for (int j=0; j<refcount; j++)
+                    for (int j = 0; j < refcount; j++)
                     {
                         fprintf(pp, " %s_splitncnn_%d", blob_name.c_str(), j);
                     }
@@ -1636,7 +1652,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
         else
         {
-            for (int j=0; j<layer.top_size(); j++)
+            for (int j = 0; j < layer.top_size(); j++)
             {
                 std::string blob_name = layer.top(j);
                 if (bottom_reference.find(blob_name) != bottom_reference.end())
@@ -1649,7 +1665,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
                         fprintf(pp, "%-16s %-16s %d %d", "Split", splitname, 1, refcount);
                         fprintf(pp, " %s", blob_name.c_str());
 
-                        for (int j=0; j<refcount; j++)
+                        for (int j = 0; j < refcount; j++)
                         {
                             fprintf(pp, " %s_splitncnn_%d", blob_name.c_str(), j);
                         }

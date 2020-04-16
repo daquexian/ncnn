@@ -20,6 +20,11 @@
 
 namespace ncnn {
 
+#if __ARM_NEON
+#include "padding_pack4.h"
+#include "padding_pack4_bf16s.h"
+#endif // __ARM_NEON
+
 DEFINE_LAYER_CREATOR(Padding_arm)
 
 Padding_arm::Padding_arm()
@@ -27,127 +32,26 @@ Padding_arm::Padding_arm()
 #if __ARM_NEON
     support_packing = true;
 #endif // __ARM_NEON
+
+    support_bf16_storage = true;
 }
 
-#if __ARM_NEON
-static void padding_constant_pack4_neon(const Mat& src, Mat& dst, int top, int bottom, int left, int right, float v)
+int Padding_arm::create_pipeline(const Option& opt)
 {
-    float32x4_t _v = vdupq_n_f32(v);
+    if (opt.use_bf16_storage)
+    {
+        value_bf16 = float32_to_bfloat16(value);
 
-    const float* ptr = src;
-    float* outptr = dst;
+        ncnn::cast_float32_to_bfloat16(per_channel_pad_data, per_channel_pad_data_bf16, opt);
+    }
 
-    // fill top
-    for (int i = 0; i < top * dst.w; i++)
-    {
-        vst1q_f32(outptr, _v);
-        outptr += 4;
-    }
-    // fill center
-    for (int y = 0; y < src.h; y++)
-    {
-        for (int x = 0; x < left; x++)
-        {
-            vst1q_f32(outptr, _v);
-            outptr += 4;
-        }
-        for (int x = 0; x < src.w; x++)
-        {
-            float32x4_t _p = vld1q_f32(ptr);
-            vst1q_f32(outptr, _p);
-            ptr += 4;
-            outptr += 4;
-        }
-        for (int x = 0; x < right; x++)
-        {
-            vst1q_f32(outptr, _v);
-            outptr += 4;
-        }
-    }
-    // fill bottom
-    for (int i = 0; i < bottom * dst.w; i++)
-    {
-        vst1q_f32(outptr, _v);
-        outptr += 4;
-    }
+    return 0;
 }
 
-static void padding_replicate_pack4_neon(const Mat& src, Mat& dst, int top, int bottom, int left, int right)
+int Padding_arm::destroy_pipeline(const Option& /*opt*/)
 {
-    const float* ptr = src;
-    float* outptr = dst;
-
-    // fill top
-    for (int y = 0; y < top; y++)
-    {
-        const float* ptr0 = ptr;
-        float32x4_t _p = vld1q_f32(ptr0);
-        for (int x = 0; x < left; x++)
-        {
-            vst1q_f32(outptr, _p);
-            outptr += 4;
-        }
-        for (int x = 0; x < src.w; x++)
-        {
-            _p = vld1q_f32(ptr0);
-            vst1q_f32(outptr, _p);
-            ptr0 += 4;
-            outptr += 4;
-        }
-        for (int x = 0; x < right; x++)
-        {
-            vst1q_f32(outptr, _p);
-            outptr += 4;
-        }
-    }
-    // fill center
-    for (int y = 0; y < src.h; y++)
-    {
-        float32x4_t _p = vld1q_f32(ptr);
-        for (int x = 0; x < left; x++)
-        {
-            vst1q_f32(outptr, _p);
-            outptr += 4;
-        }
-        for (int x = 0; x < src.w; x++)
-        {
-            _p = vld1q_f32(ptr);
-            vst1q_f32(outptr, _p);
-            ptr += 4;
-            outptr += 4;
-        }
-        for (int x = 0; x < right; x++)
-        {
-            vst1q_f32(outptr, _p);
-            outptr += 4;
-        }
-    }
-    // fill bottom
-    ptr -= src.w * 4;
-    for (int y = 0; y < bottom; y++)
-    {
-        const float* ptr0 = ptr;
-        float32x4_t _p = vld1q_f32(ptr0);
-        for (int x = 0; x < left; x++)
-        {
-            vst1q_f32(outptr, _p);
-            outptr += 4;
-        }
-        for (int x = 0; x < src.w; x++)
-        {
-            _p = vld1q_f32(ptr0);
-            vst1q_f32(outptr, _p);
-            ptr0 += 4;
-            outptr += 4;
-        }
-        for (int x = 0; x < right; x++)
-        {
-            vst1q_f32(outptr, _p);
-            outptr += 4;
-        }
-    }
+    return 0;
 }
-#endif // __ARM_NEON
 
 int Padding_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
@@ -156,6 +60,9 @@ int Padding_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
         top_blob = bottom_blob;
         return 0;
     }
+
+    if (opt.use_bf16_storage)
+        return forward_bf16s(bottom_blob, top_blob, opt);
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
@@ -171,14 +78,16 @@ int Padding_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
 
         if (dims == 1)
         {
-            top_blob.create(outw, elemsize, opt.blob_allocator);
+            top_blob.create(outw, elemsize, elempack, opt.blob_allocator);
             if (top_blob.empty())
                 return -100;
 
             if (type == 0)
-                padding_constant_pack4_neon(bottom_blob, top_blob, 0, 0, left, right, value);
-            else
+                padding_constant_pack4_neon(bottom_blob, top_blob, 0, 0, left, right, vdupq_n_f32(value));
+            if (type == 1)
                 padding_replicate_pack4_neon(bottom_blob, top_blob, 0, 0, left, right);
+            if (type == 2)
+                padding_reflect_pack4_neon(bottom_blob, top_blob, 0, 0, left, right);
 
             return 0;
         }
@@ -187,21 +96,23 @@ int Padding_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
 
         if (dims == 2)
         {
-            top_blob.create(outw, outh, elemsize, opt.blob_allocator);
+            top_blob.create(outw, outh, elemsize, elempack, opt.blob_allocator);
             if (top_blob.empty())
                 return -100;
 
             if (type == 0)
-                padding_constant_pack4_neon(bottom_blob, top_blob, top, bottom, left, right, value);
-            else
+                padding_constant_pack4_neon(bottom_blob, top_blob, top, bottom, left, right, vdupq_n_f32(value));
+            if (type == 1)
                 padding_replicate_pack4_neon(bottom_blob, top_blob, top, bottom, left, right);
+            if (type == 2)
+                padding_reflect_pack4_neon(bottom_blob, top_blob, top, bottom, left, right);
 
             return 0;
         }
 
         if (dims == 3)
         {
-            top_blob.create(outw, outh, channels, elemsize, opt.blob_allocator);
+            top_blob.create(outw, outh, channels, elemsize, elempack, opt.blob_allocator);
             if (top_blob.empty())
                 return -100;
 
@@ -211,10 +122,94 @@ int Padding_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
                 const Mat m = bottom_blob.channel(q);
                 Mat borderm = top_blob.channel(q);
 
+                float32x4_t pad_value = per_channel_pad_data_size ? vld1q_f32((const float*)per_channel_pad_data + q * 4) : vdupq_n_f32(value);
+
                 if (type == 0)
-                    padding_constant_pack4_neon(m, borderm, top, bottom, left, right, value);
-                else
+                    padding_constant_pack4_neon(m, borderm, top, bottom, left, right, pad_value);
+                if (type == 1)
                     padding_replicate_pack4_neon(m, borderm, top, bottom, left, right);
+                if (type == 2)
+                    padding_reflect_pack4_neon(m, borderm, top, bottom, left, right);
+            }
+
+            return 0;
+        }
+
+        return 0;
+    }
+#endif // __ARM_NEON
+
+    return Padding::forward(bottom_blob, top_blob, opt);
+}
+
+int Padding_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+    int channels = bottom_blob.c;
+    int dims = bottom_blob.dims;
+    size_t elemsize = bottom_blob.elemsize;
+    int elempack = bottom_blob.elempack;
+
+#if __ARM_NEON
+    if (elempack == 4)
+    {
+        int outw = w + left + right;
+
+        if (dims == 1)
+        {
+            top_blob.create(outw, elemsize, elempack, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+            if (type == 0)
+                padding_constant_pack4_bf16_neon(bottom_blob, top_blob, 0, 0, left, right, vdupq_n_u16(value_bf16));
+            if (type == 1)
+                padding_replicate_pack4_bf16_neon(bottom_blob, top_blob, 0, 0, left, right);
+            if (type == 2)
+                padding_reflect_pack4_bf16_neon(bottom_blob, top_blob, 0, 0, left, right);
+
+            return 0;
+        }
+
+        int outh = h + top + bottom;
+
+        if (dims == 2)
+        {
+            top_blob.create(outw, outh, elemsize, elempack, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+            if (type == 0)
+                padding_constant_pack4_bf16_neon(bottom_blob, top_blob, top, bottom, left, right, vdupq_n_u16(value_bf16));
+            if (type == 1)
+                padding_replicate_pack4_bf16_neon(bottom_blob, top_blob, top, bottom, left, right);
+            if (type == 2)
+                padding_reflect_pack4_bf16_neon(bottom_blob, top_blob, top, bottom, left, right);
+
+            return 0;
+        }
+
+        if (dims == 3)
+        {
+            top_blob.create(outw, outh, channels, elemsize, elempack, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q=0; q<channels; q++)
+            {
+                const Mat m = bottom_blob.channel(q);
+                Mat borderm = top_blob.channel(q);
+
+                uint16x4_t pad_value = per_channel_pad_data_size ? vld1_u16((const unsigned short*)per_channel_pad_data_bf16 + q * 4) : vdup_n_u16(value_bf16);
+
+                if (type == 0)
+                    padding_constant_pack4_bf16_neon(m, borderm, top, bottom, left, right, vcombine_u16(pad_value, pad_value));
+                if (type == 1)
+                    padding_replicate_pack4_bf16_neon(m, borderm, top, bottom, left, right);
+                if (type == 2)
+                    padding_reflect_pack4_bf16_neon(m, borderm, top, bottom, left, right);
             }
 
             return 0;

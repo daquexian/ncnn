@@ -18,6 +18,7 @@
 #if __ARM_NEON
 #include <arm_neon.h>
 #include "neon_mathfun.h"
+#include "neon_activation.h"
 #endif // __ARM_NEON
 
 namespace ncnn {
@@ -29,6 +30,10 @@ DEFINE_LAYER_CREATOR(Deconvolution_arm)
 
 Deconvolution_arm::Deconvolution_arm()
 {
+#if __ARM_NEON
+    support_packing = true;
+#endif // __ARM_NEON
+
     activation = 0;
 }
 
@@ -68,16 +73,11 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
 
     if (activation)
     {
-        Option opt_cpu = opt;
-        opt_cpu.use_vulkan_compute = false;
-        activation->create_pipeline(opt_cpu);
+        activation->create_pipeline(opt);
     }
 
     const int maxk = kernel_w * kernel_h;
     int num_input = weight_data_size / maxk / num_output;
-
-    if (opt.use_packing_layout)
-    {
 
     Mat weight_data_transposed(weight_data.w);
     {
@@ -96,8 +96,12 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
         }
     }
 
+    int elempack = (opt.use_packing_layout && num_input % 4 == 0) ? 4 : 1;
+    int out_elempack = (opt.use_packing_layout && num_output % 4 == 0) ? 4 : 1;
+
+#if __ARM_NEON
     // pack4
-    if (num_input % 4 == 0 && num_output % 4 == 0)
+    if (elempack == 4 && out_elempack == 4)
     {
         // src = kw-kh-inch-outch
         // dst = 4a-4b-kw-kh-inch/4a-outch/4b
@@ -169,7 +173,7 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
     }
 
     // pack1to4
-    if (num_input % 4 != 0 && num_output % 4 == 0)
+    if (elempack == 1 && out_elempack == 4)
     {
         // src = kw-kh-inch-outch
         // dst = 4b-kw-kh-inch-outch/4b
@@ -211,7 +215,7 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
     }
 
     // pack4to1
-    if (num_input % 4 == 0 && num_output % 4 != 0)
+    if (elempack == 4 && out_elempack == 1)
     {
         // src = kw-kh-inch-outch
         // dst = 4a-kw-kh-inch/4a-outch
@@ -247,8 +251,13 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
             }
         }
     }
+#endif // __ARM_NEON
 
-    } // opt.use_packing_layout
+    // pack1
+    if (elempack == 1 && out_elempack == 1)
+    {
+        weight_data_pack1 = weight_data_transposed;
+    }
 
     return 0;
 }
@@ -257,9 +266,7 @@ int Deconvolution_arm::destroy_pipeline(const Option& opt)
 {
     if (activation)
     {
-        Option opt_cpu = opt;
-        opt_cpu.use_vulkan_compute = false;
-        activation->destroy_pipeline(opt_cpu);
+        activation->destroy_pipeline(opt);
         delete activation;
         activation = 0;
     }
@@ -271,9 +278,6 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 {
     // deconvolv with NxN kernel
     // value = value + bias
-
-    if (opt.use_packing_layout)
-    {
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
@@ -288,26 +292,25 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
     int outw = (w - 1) * stride_w + kernel_extent_w;
     int outh = (h - 1) * stride_h + kernel_extent_h;
-    int out_elempack = num_output % 4 == 0 ? 4 : 1;
+    int out_elempack = (opt.use_packing_layout && num_output % 4 == 0) ? 4 : 1;
     size_t out_elemsize = elemsize / elempack * out_elempack;
 
     Mat top_blob_bordered;
-    if (pad_w > 0 || pad_h > 0)
+    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0 || output_pad_right > 0 || output_pad_bottom > 0 || (output_w > 0 && output_h > 0))
     {
         top_blob_bordered.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.workspace_allocator);
-        if (top_blob_bordered.empty())
-            return -100;
     }
     else
     {
         top_blob_bordered = top_blob;
         top_blob_bordered.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
-        if (top_blob_bordered.empty())
-            return -100;
     }
+    if (top_blob_bordered.empty())
+        return -100;
 
     const int maxk = kernel_w * kernel_h;
 
+#if __ARM_NEON
     if (elempack == 4 && out_elempack == 4)
     {
         // num_output
@@ -337,21 +340,21 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         for (int y = 0; y < kernel_h; y++)
                         {
                             int sys = (i + y * dilation_h - (kernel_extent_h - 1));
-                            if (sys % stride_h != 0)
+                            if (sys < 0 || sys % stride_h != 0)
                                 continue;
 
                             int sy = sys / stride_h;
-                            if (sy < 0 || sy >= h)
+                            if (sy >= h)
                                 continue;
 
                             for (int x = 0; x < kernel_w; x++)
                             {
                                 int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
-                                if (sxs % stride_w != 0)
+                                if (sxs < 0 || sxs % stride_w != 0)
                                     continue;
 
                                 int sx = sxs / stride_w;
-                                if (sx < 0 || sx >= w)
+                                if (sx >= w)
                                     continue;
 
                                 const float* sptr = m.row(sy) + sx * 4;
@@ -382,37 +385,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         kptr += maxk * 16;
                     }
 
-                    if (activation_type == 1)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        _sum = vmaxq_f32(_sum, _zero);
-                    }
-                    else if (activation_type == 2)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        float32x4_t _slope = vdupq_n_f32(activation_params[0]);
-                        uint32x4_t _lemask = vcleq_f32(_sum, _zero);
-                        float32x4_t _ps = vmulq_f32(_sum, _slope);
-                        _sum = vbslq_f32(_lemask, _ps, _sum);
-                    }
-                    else if (activation_type == 3)
-                    {
-                        float32x4_t _min = vdupq_n_f32(activation_params[0]);
-                        float32x4_t _max = vdupq_n_f32(activation_params[1]);
-                        _sum = vmaxq_f32(_sum, _min);
-                        _sum = vminq_f32(_sum, _max);
-                    }
-                    else if (activation_type == 4)
-                    {
-                        float32x4_t _one = vdupq_n_f32(1.f);
-                        _sum = vnegq_f32(_sum);
-                        _sum = exp_ps(_sum);
-                        _sum = vaddq_f32(_sum, _one);
-                        float32x4_t _outp = vrecpeq_f32(_sum);
-                        _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-//                         _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-                        _sum = _outp;
-                    }
+                    _sum = activation_ps(_sum, activation_type, activation_params);
 
                     vst1q_f32(outptr + j * 4, _sum);
                 }
@@ -451,11 +424,11 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         for (int y = 0; y < kernel_h; y++)
                         {
                             int sys = (i + y * dilation_h - (kernel_extent_h - 1));
-                            if (sys % stride_h != 0)
+                            if (sys < 0 || sys % stride_h != 0)
                                 continue;
 
                             int sy = sys / stride_h;
-                            if (sy < 0 || sy >= h)
+                            if (sy >= h)
                                 continue;
 
                             const float* sptr = m.row(sy);
@@ -463,11 +436,11 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                             for (int x = 0; x < kernel_w; x++)
                             {
                                 int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
-                                if (sxs % stride_w != 0)
+                                if (sxs < 0 || sxs % stride_w != 0)
                                     continue;
 
                                 int sx = sxs / stride_w;
-                                if (sx < 0 || sx >= w)
+                                if (sx >= w)
                                     continue;
 
                                 float32x4_t _val = vdupq_n_f32( sptr[ sx ] );
@@ -483,37 +456,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         kptr += maxk * 4;
                     }
 
-                    if (activation_type == 1)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        _sum = vmaxq_f32(_sum, _zero);
-                    }
-                    else if (activation_type == 2)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        float32x4_t _slope = vdupq_n_f32(activation_params[0]);
-                        uint32x4_t _lemask = vcleq_f32(_sum, _zero);
-                        float32x4_t _ps = vmulq_f32(_sum, _slope);
-                        _sum = vbslq_f32(_lemask, _ps, _sum);
-                    }
-                    else if (activation_type == 3)
-                    {
-                        float32x4_t _min = vdupq_n_f32(activation_params[0]);
-                        float32x4_t _max = vdupq_n_f32(activation_params[1]);
-                        _sum = vmaxq_f32(_sum, _min);
-                        _sum = vminq_f32(_sum, _max);
-                    }
-                    else if (activation_type == 4)
-                    {
-                        float32x4_t _one = vdupq_n_f32(1.f);
-                        _sum = vnegq_f32(_sum);
-                        _sum = exp_ps(_sum);
-                        _sum = vaddq_f32(_sum, _one);
-                        float32x4_t _outp = vrecpeq_f32(_sum);
-                        _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-//                         _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-                        _sum = _outp;
-                    }
+                    _sum = activation_ps(_sum, activation_type, activation_params);
 
                     vst1q_f32(outptr + j * 4, _sum);
                 }
@@ -552,21 +495,21 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         for (int y = 0; y < kernel_h; y++)
                         {
                             int sys = (i + y * dilation_h - (kernel_extent_h - 1));
-                            if (sys % stride_h != 0)
+                            if (sys < 0 || sys % stride_h != 0)
                                 continue;
 
                             int sy = sys / stride_h;
-                            if (sy < 0 || sy >= h)
+                            if (sy >= h)
                                 continue;
 
                             for (int x = 0; x < kernel_w; x++)
                             {
                                 int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
-                                if (sxs % stride_w != 0)
+                                if (sxs < 0 || sxs % stride_w != 0)
                                     continue;
 
                                 int sx = sxs / stride_w;
-                                if (sx < 0 || sx >= w)
+                                if (sx >= w)
                                     continue;
 
                                 const float* sptr = m.row(sy) + sx * 4;
@@ -591,28 +534,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         kptr += maxk * 4;
                     }
 
-                    if (activation_type == 1)
-                    {
-                        sum = std::max(sum, 0.f);
-                    }
-                    else if (activation_type == 2)
-                    {
-                        float slope = activation_params[0];
-                        sum = sum > 0.f ? sum : sum * slope;
-                    }
-                    else if (activation_type == 3)
-                    {
-                        float min = activation_params[0];
-                        float max = activation_params[1];
-                        if (sum < min)
-                            sum = min;
-                        if (sum > max)
-                            sum = max;
-                    }
-                    else if (activation_type == 4)
-                    {
-                        sum = 1.f / (1.f + exp(-sum));
-                    }
+                    sum = activation_ss(sum, activation_type, activation_params);
 
                     outptr[j] = sum;
                 }
@@ -621,10 +543,183 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             }
         }
     }
+#endif // __ARM_NEON
 
-    if (pad_w > 0 || pad_h > 0)
+    if (elempack == 1 && out_elempack == 1)
     {
-        copy_cut_border(top_blob_bordered, top_blob, pad_h, pad_h, pad_w, pad_w, opt);
+        if (kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
+        {
+            deconv3x3s1_neon(bottom_blob, top_blob_bordered, weight_data, bias_data, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else if (kernel_w == 3 && kernel_h == 3 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            deconv3x3s2_neon(bottom_blob, top_blob_bordered, weight_data, bias_data, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else if (kernel_w == 4 && kernel_h == 4 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
+        {
+            deconv4x4s1_neon(bottom_blob, top_blob_bordered, weight_data, bias_data, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else if (kernel_w == 4 && kernel_h == 4 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            deconv4x4s2_neon(bottom_blob, top_blob_bordered, weight_data, bias_data, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else
+        {
+            // num_output
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int p=0; p<num_output; p++)
+            {
+                float* outptr = top_blob_bordered.channel(p);
+
+                for (int i = 0; i < outh; i++)
+                {
+                    for (int j = 0; j < outw; j++)
+                    {
+                        float sum = 0.f;
+
+                        if (bias_term)
+                        {
+                            sum = bias_data[p];
+                        }
+
+                        const float* kptr = (const float*)weight_data_pack1 + maxk * channels * p;
+
+                        // channels
+                        for (int q=0; q<channels; q++)
+                        {
+                            const Mat m = bottom_blob.channel(q);
+
+                            for (int y = 0; y < kernel_h; y++)
+                            {
+                                int sys = (i + y * dilation_h - (kernel_extent_h - 1));
+                                if (sys < 0 || sys % stride_h != 0)
+                                    continue;
+
+                                int sy = sys / stride_h;
+                                if (sy >= h)
+                                    continue;
+
+                                const float* sptr = m.row(sy);
+
+                                for (int x = 0; x < kernel_w; x++)
+                                {
+                                    int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
+                                    if (sxs < 0 || sxs % stride_w != 0)
+                                        continue;
+
+                                    int sx = sxs / stride_w;
+                                    if (sx >= w)
+                                        continue;
+
+                                    float val = sptr[ sx ];
+
+                                    int k = y * kernel_w + x;
+
+                                    float w = kptr[ k ];
+
+                                    sum += val * w;
+                                }
+                            }
+
+                            kptr += maxk;
+                        }
+
+                        if (activation_type == 1)
+                        {
+                            sum = std::max(sum, 0.f);
+                        }
+                        else if (activation_type == 2)
+                        {
+                            float slope = activation_params[0];
+                            sum = sum > 0.f ? sum : sum * slope;
+                        }
+                        else if (activation_type == 3)
+                        {
+                            float min = activation_params[0];
+                            float max = activation_params[1];
+                            if (sum < min)
+                                sum = min;
+                            if (sum > max)
+                                sum = max;
+                        }
+                        else if (activation_type == 4)
+                        {
+                            sum = static_cast<float>(1.f / (1.f + exp(-sum)));
+                        }
+
+                        outptr[j] = sum;
+                    }
+
+                    outptr += outw;
+                }
+            }
+        }
+    }
+
+    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
+    {
+        Mat top_blob_bordered_adj = top_blob_bordered;
+        if (output_pad_right > 0 || output_pad_bottom > 0)
+        {
+            Option opt_b = opt;
+            opt_b.blob_allocator = opt.workspace_allocator;
+            copy_make_border(top_blob_bordered, top_blob_bordered_adj, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt_b);
+            if (top_blob_bordered_adj.empty())
+                return -100;
+        }
+
+        copy_cut_border(top_blob_bordered_adj, top_blob, pad_top, pad_bottom, pad_left, pad_right, opt);
+        if (top_blob.empty())
+            return -100;
+
+        outw = top_blob.w;
+        outh = top_blob.h;
+    }
+    else if (output_w > 0 && output_h > 0)
+    {
+        Mat top_blob_bordered_adj = top_blob_bordered;
+        if (output_pad_right > 0 || output_pad_bottom > 0)
+        {
+            Option opt_b = opt;
+            opt_b.blob_allocator = opt.workspace_allocator;
+            copy_make_border(top_blob_bordered, top_blob_bordered_adj, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt_b);
+            if (top_blob_bordered_adj.empty())
+                return -100;
+        }
+
+        int wcut = top_blob_bordered_adj.w - output_w;
+        int hcut = top_blob_bordered_adj.h - output_h;
+
+        if (pad_left == -233 || pad_right == -233 || pad_top == -233 || pad_bottom == -233)
+        {
+            // onnx padding=SAME_UPPER
+            copy_cut_border(top_blob_bordered_adj, top_blob, hcut / 2, hcut - hcut / 2, wcut / 2, wcut - wcut / 2, opt);
+        }
+        else if (pad_left == -234 || pad_right == -234 || pad_top == -234 || pad_bottom == -234)
+        {
+            // onnx padding=SAME_LOWER
+            copy_cut_border(top_blob_bordered_adj, top_blob, hcut - hcut / 2, hcut / 2, wcut - wcut / 2, wcut / 2, opt);
+        }
         if (top_blob.empty())
             return -100;
 
@@ -633,88 +728,16 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
     }
     else
     {
-        top_blob = top_blob_bordered;
-    }
-
-    return 0;
-
-    } // opt.use_packing_layout
-
-    if (kernel_w != kernel_h || stride_w != stride_h)
-    {
-        return Deconvolution::forward(bottom_blob, top_blob, opt);
-    }
-
-    const int kernel_size = kernel_w;
-    const int stride = stride_w;
-
-    if ((kernel_size != 3 && kernel_size != 4) || stride > 2 || dilation_w != 1 || dilation_h != 1)
-    {
-        return Deconvolution::forward(bottom_blob, top_blob, opt);
-    }
-
-    typedef void (*deconv_func)(const Mat&, Mat&, const Mat&, const Mat&, const Option&);
-
-    // kernel_size x stride
-    deconv_func deconv_func_table[2][2] =
-    {
+        if (output_pad_right > 0 || output_pad_bottom > 0)
         {
-            deconv3x3s1_neon,
-            deconv3x3s2_neon
-        },  // kernel_size = 3
+            copy_make_border(top_blob_bordered, top_blob, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt);
+            if (top_blob.empty())
+                return -100;
+        }
+        else
         {
-            deconv4x4s1_neon,
-            deconv4x4s2_neon
-        }   // kernel_size = 4
-    };
-
-    deconv_func deconv = deconv_func_table[kernel_size-3][stride-1];
-    if (!deconv)
-    {
-        return Deconvolution::forward(bottom_blob, top_blob, opt);
-    }
-
-    int w = bottom_blob.w;
-    int h = bottom_blob.h;
-    size_t elemsize = bottom_blob.elemsize;
-
-    int outw = (w - 1) * stride + kernel_size;
-    int outh = (h - 1) * stride + kernel_size;
-
-    Mat top_blob_bordered;
-    if (pad_w > 0 || pad_h > 0)
-    {
-        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.workspace_allocator);
-        if (top_blob_bordered.empty())
-            return -100;
-    }
-    else
-    {
-        top_blob_bordered = top_blob;
-        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.blob_allocator);
-        if (top_blob_bordered.empty())
-            return -100;
-    }
-
-    deconv(bottom_blob, top_blob_bordered, weight_data, bias_data, opt);
-
-    if (pad_w > 0 || pad_h > 0)
-    {
-        copy_cut_border(top_blob_bordered, top_blob, pad_h, pad_h, pad_w, pad_w, opt);
-        if (top_blob.empty())
-            return -100;
-
-        outw = top_blob.w;
-        outh = top_blob.h;
-    }
-    else
-    {
-        top_blob = top_blob_bordered;
-    }
-
-    if (activation)
-    {
-        activation->forward_inplace(top_blob, opt);
+            top_blob = top_blob_bordered;
+        }
     }
 
     return 0;
