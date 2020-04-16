@@ -171,7 +171,7 @@ static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
     return 0;
 }
 
-static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, FILE* bp)
+static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, std::vector<char> &bp)
 {
     int size = get_tensor_proto_data_size(tp);
 
