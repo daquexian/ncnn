@@ -37,9 +37,9 @@
 
 #include <dqx_helper.h>
 
-#define stderr fake_stderr
+#define stderr fake_stderr_caffe
 
-FILE *fake_stderr;
+FILE *fake_stderr_caffe;
 
 namespace caffe = caffe_ncnn;
 
@@ -294,6 +294,17 @@ static bool quantize_weight(float *data, size_t data_length, int quantize_level,
     return true;
 }
 
+namespace {
+std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+    }
+    return str;
+}
+}
+
 tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str, const std::string &model_str) {
     // const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.proto";
     // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
@@ -302,7 +313,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     char *error_buf;
     size_t error_size;
     // redirect stderr
-    fake_stderr = open_memstream(&error_buf, &error_size);
+    fake_stderr_caffe = open_memstream(&error_buf, &error_size);
 
     const char* ncnn_prototxt = "ncnn.proto";
     const char* ncnn_modelbin = "ncnn.bin";
@@ -1689,6 +1700,9 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     }
     fclose(stderr);
     std::string error_str(error_buf, error_size);
+
+    // replace newline to html <br/>
+    error_str = ReplaceAll(error_str, "\n", "<br/>");
 
     return std::make_tuple(pp, bp, error_str);
 }

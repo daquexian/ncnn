@@ -1112,6 +1112,17 @@ static void fuse_pixelshuffle(onnx::GraphProto* mutable_graph, std::map<std::str
     }
 }
 
+namespace {
+std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+    }
+    return str;
+}
+}
+
 tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 {
     std::vector<char> pp;
@@ -3167,6 +3178,9 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
     }
     fclose(stderr);
     std::string error_str(error_buf, error_size);
+
+    // replace newline to html <br/>
+    error_str = ReplaceAll(error_str, "\n", "<br/>");
 
     return std::make_tuple(pp, bp, error_str);
 }
