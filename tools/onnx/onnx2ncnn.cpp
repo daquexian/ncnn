@@ -29,6 +29,10 @@
 #include <onnx/onnx_pb.h>
 #include <wmc_utils.h>
 
+#define stderr fake_stderr
+
+FILE *fake_stderr;
+
 static std::vector<int> get_node_attr_ai(const onnx::NodeProto& node, const char* key)
 {
     std::vector<int> v;
@@ -1112,6 +1116,10 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 {
     std::vector<char> pp;
     std::vector<char> bp;
+    char *error_buf;
+    size_t error_size;
+    // redirect stderr
+    fake_stderr = open_memstream(&error_buf, &error_size);
 
     onnx::ModelProto model;
     bool s1 = model.ParseFromString(model_str);
@@ -1766,7 +1774,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
         }
         else
         {
-            return tl::make_unexpected(op + " not supported yet!");
+            fprintf(stderr, "%s not supported yet!", op.c_str());
         }
 
         fprintf(pp, " %-24s %d %d", name.c_str(), input_size, output_size);
@@ -2225,7 +2233,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             int axis = get_node_attr_i(node, "axis", 1);
             if (axis != 1)
             {
-                return tl::make_unexpected( "Unsupported Flatten axis " + std::to_string(axis) + "!");
+                fprintf(stderr, "Unsupported Flatten axis %d!\n", axis);
             }
         }
         else if (op == "Floor")
@@ -2866,7 +2874,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             for (int i=0; i<(int)steps.size(); i++)
             {
                 if (steps[i] != 1) {
-                    tl::make_unexpected("Unsupported slice step !");
+                    fprintf(stderr, "Unsupported slice step!\n");
 
                 }
             }
@@ -3021,7 +3029,7 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
                 else if (perm[1] == 3 && perm[2] == 4 && perm[3] == 2 && perm[4] == 1)
                     fprintf(pp, " 0=5");// c h wx
                 else
-                    return tl::make_unexpected( "Unsupported transpose type !");
+                    fprintf(stderr, "Unsupported transpose type !");
             }
         }
         else if (op == "Upsample")
@@ -3157,7 +3165,8 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
         }
     }
+    fclose(stderr);
+    std::string error_str(error_buf, error_size);
 
-    return std::make_pair(pp, bp);
+    return std::make_tuple(pp, bp, error_str);
 }
-

@@ -37,6 +37,9 @@
 
 #include <dqx_helper.h>
 
+#define stderr fake_stderr
+
+FILE *fake_stderr;
 
 namespace caffe = caffe_ncnn;
 
@@ -296,6 +299,11 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
     // const char* quantize_param = argc >= 6 ? argv[5] : "0";
     // const char* int8scale_table_path = argc == 7 ? argv[6] : NULL;
+    char *error_buf;
+    size_t error_size;
+    // redirect stderr
+    fake_stderr = open_memstream(&error_buf, &error_size);
+
     const char* ncnn_prototxt = "ncnn.proto";
     const char* ncnn_modelbin = "ncnn.bin";
     const char* quantize_param = "0";
@@ -1679,6 +1687,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
 
     }
+    fclose(stderr);
+    std::string error_str(error_buf, error_size);
 
-    return std::make_pair(pp, bp);
+    return std::make_tuple(pp, bp, error_str);
 }
