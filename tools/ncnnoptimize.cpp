@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <set>
 #include <vector>
+#include <iostream>
 
 // ncnn public header
 #include "datareader.h"
@@ -82,6 +83,9 @@
 #include "layer/yolodetectionoutput.h"
 #include "layer/yolov3detectionoutput.h"
 
+#include <wmc_utils.h>
+#include <expected.hpp>
+
 #if defined(__aarch64__) && defined(LINUX)
 #include <locale>
 #include <chrono>
@@ -95,6 +99,10 @@
 #define CLR         "\033[0m"
 
 #endif // defined(__aarch64__) && defined(LINUX)
+
+#define stderr fake_stderr_optimize
+
+FILE *fake_stderr_optimize;
 
 class DataReaderFromEmpty : public ncnn::DataReader
 {
@@ -144,7 +152,7 @@ public:
     int fwrite_weight_tag_data(int tag, const ncnn::Mat& data, FILE* bp);
     int fwrite_weight_data(const ncnn::Mat& data, FILE* bp);
 
-    int save(const char* parampath, const char* binpath);
+    int save(char **pp_ptr, size_t *pp_size, char **bp_ptr, size_t *bp_size);
 
 #if defined(__aarch64__) && defined(LINUX)
     void gauss_random(ncnn::Mat &m);
@@ -1935,10 +1943,13 @@ int NetOptimize::fwrite_weight_data(const ncnn::Mat& data, FILE* bp)
     return 0;
 }
 
-int NetOptimize::save(const char* parampath, const char* binpath)
+int NetOptimize::save(char **pp_ptr, size_t *pp_size, char **bp_ptr, size_t *bp_size)
 {
-    FILE* pp = fopen(parampath, "wb");
-    FILE* bp = fopen(binpath, "wb");
+    // FILE* pp = fopen(parampath, "wb");
+    // FILE* bp = fopen(binpath, "wb");
+
+    FILE *pp = open_memstream (pp_ptr, pp_size);
+    FILE *bp = open_memstream (bp_ptr, bp_size);
 
     fprintf(pp, "7767517\n");
 
@@ -2667,8 +2678,9 @@ int NetOptimize::save(const char* parampath, const char* binpath)
     return 0;
 }
 
-int main(int argc, char** argv)
+tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, const unsigned char *inbin, int flag)
 {
+#if !defined(__EMSCRIPTEN__)
 #if defined(__aarch64__) && defined(LINUX)
     if (argc != 10)
     {
@@ -2686,12 +2698,17 @@ int main(int argc, char** argv)
         return -1;
     }
 #endif // defined(__aarch64__) && defined(LINUX)
+#endif
 
-    const char* inparam = argv[1];
-    const char* inbin = argv[2];
-    const char* outparam = argv[3];
-    const char* outbin = argv[4];
-    int flag = atoi(argv[5]);
+    // const char* inparam = argv[1];
+    // const char* inbin = argv[2];
+    // const char* outparam = argv[3];
+    // const char* outbin = argv[4];
+    // int flag = atoi(argv[5]);
+    char *error_buf;
+    size_t error_size;
+    // redirect stderr
+    stderr = open_memstream(&error_buf, &error_size);
 
     NetOptimize optimizer;
 
@@ -2704,14 +2721,19 @@ int main(int argc, char** argv)
         optimizer.storage_type = 0;
     }
 
-    optimizer.load_param(inparam);
-    if (strcmp(inbin, "null") == 0)
-    {
-        DataReaderFromEmpty dr;
-        optimizer.load_model(dr);
-    }
-    else
-        optimizer.load_model(inbin);
+    // load_param mem version
+    int s1 = optimizer.load_param_mem(reinterpret_cast<const char *>(inparam));
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+    std::cout << s1 << std::endl;
+    // if (strcmp(inbin, "null") == 0)
+    // {
+    //     DataReaderFromEmpty dr;
+    //     optimizer.load_model(dr);
+    // }
+    // else
+    int s2 = optimizer.load_model(inbin);
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+    std::cout << s2 << std::endl;
 
 #if defined(__aarch64__) && defined(LINUX)
     optimizer.find_fastest_fp32_conv(dataname, inw, inh, inc);
@@ -2744,7 +2766,19 @@ int main(int argc, char** argv)
 
     optimizer.shape_inference();
 
-    optimizer.save(outparam, outbin);
+    char *pp_ptr, *bp_ptr;
+    size_t pp_size, bp_size;
 
-    return 0;
+    optimizer.save(&pp_ptr, &pp_size, &bp_ptr, &bp_size);
+
+    fclose(stderr);
+    std::string outparam(pp_ptr, pp_size);
+    std::string outbin(bp_ptr, bp_size);
+    std::string error_str(error_buf, error_size);
+    // replace newline to html <br/>
+    error_str = ReplaceAll(error_str, "\n", "<br/>");
+
+    return std::make_tuple(std::vector<char>(outparam.begin(), outparam.end()),
+            std::vector<char>(outbin.begin(), outbin.end()),
+            error_str);
 }

@@ -294,17 +294,17 @@ static bool quantize_weight(float *data, size_t data_length, int quantize_level,
     return true;
 }
 
-namespace {
-std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
-    size_t start_pos = 0;
-    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
-        str.replace(start_pos, from.length(), to);
-        start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
-    }
-    return str;
-}
-}
-
+// namespace {
+// std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
+//     size_t start_pos = 0;
+//     while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+//         str.replace(start_pos, from.length(), to);
+//         start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+//     }
+//     return str;
+// }
+// }
+//
 tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str, const std::string &model_str) {
     // const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.proto";
     // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";

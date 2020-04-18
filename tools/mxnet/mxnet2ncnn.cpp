@@ -924,12 +924,16 @@ static void fuse_hardsigmoid_hardswish(std::vector<MXNetNode>& nodes, std::vecto
     }
 }
 
-int main(int argc, char** argv)
+tl::expected<NcnnModel, std::string> mxnet2ncnn(const std::string &nodes_str, const std::string &params_str) {
 {
-    const char* jsonpath = argv[1];
-    const char* parampath = argv[2];
-    const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.param";
-    const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
+    // const char* jsonpath = argv[1];
+    // const char* parampath = argv[2];
+    // const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.param";
+    // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
+    char *error_buf;
+    size_t error_size;
+    // redirect stderr
+    fake_stderr_caffe = open_memstream(&error_buf, &error_size);
 
     std::vector<MXNetNode> nodes;
     std::vector<MXNetParam> params;
