@@ -101,8 +101,7 @@
 #endif // defined(__aarch64__) && defined(LINUX)
 
 #define stderr fake_stderr_optimize
-
-FILE *fake_stderr_optimize;
+FakeFile stderr;
 
 class DataReaderFromEmpty : public ncnn::DataReader
 {
@@ -1755,11 +1754,16 @@ int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
 
 int NetOptimize::shape_inference()
 {
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     const size_t layer_count = layers.size();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     const size_t blob_count = blobs.size();
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     ncnn::Extractor ex = create_extractor();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // prepare Input blobs
     for (size_t i=0; i<layer_count; i++)
     {
@@ -1767,58 +1771,75 @@ int NetOptimize::shape_inference()
         if (layer->type == "ncnnfused")
             continue;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         if (layer->type != "Input")
             continue;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ncnn::Input* input = (ncnn::Input*)layer;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         int w = input->w;
         int h = input->h;
         int c = input->c;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         int dims = 0;
         if (w == 0 && h == 0 && c == 0) dims = 0;
         if (w != 0 && h == 0 && c == 0) dims = 1;
         if (w != 0 && h != 0 && c == 0) dims = 2;
         if (w != 0 && h != 0 && c != 0) dims = 3;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         if (dims == 0)
         {
             fprintf(stderr, "Input layer %s without shape info, shape_inference aborted\n", layer->name.c_str());
             return -1;
         }
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ncnn::Mat m;
         if (dims == 1) m.create(w);
         if (dims == 2) m.create(w, h);
         if (dims == 3) m.create(w, h, c);
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
         ex.input(layer->tops[0], m);
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     }
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     // prepare blobs with predefined shape
     for (size_t i=0; i<blob_count; i++)
     {
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         const ncnn::Blob blob = blobs[i];
 
         int dims = blob.shape.dims;
         int w = blob.shape.w;
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         int h = blob.shape.h;
         int c = blob.shape.c;
 
         if (dims == 0)
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             continue;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ncnn::Mat m;
         if (dims == 1) m.create(w);
         if (dims == 2) m.create(w, h);
         if (dims == 3) m.create(w, h, c);
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ex.input(int(i), m);
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     }
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     fprintf(stderr, "shape_inference\n");
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // resolve all layer output blob shape
     for (size_t i=0; i<layer_count; i++)
     {
@@ -1830,13 +1851,16 @@ int NetOptimize::shape_inference()
         {
             int top_blob_index = layer->tops[j];
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             ncnn::Mat m;
             ex.extract(top_blob_index, m);
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             blobs[top_blob_index].shape = m;
         }
     }
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // assign all layer blob shape
     for (size_t i=0; i<layer_count; i++)
     {
@@ -1844,20 +1868,25 @@ int NetOptimize::shape_inference()
         if (layer->type == "ncnnfused")
             continue;
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         layer->bottom_shapes.resize(layer->bottoms.size());
         for (size_t j=0; j<layer->bottoms.size(); j++)
         {
             int bottom_blob_index = layer->bottoms[j];
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
             layer->bottom_shapes[j] = blobs[bottom_blob_index].shape;
         }
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         layer->top_shapes.resize(layer->tops.size());
         for (size_t j=0; j<layer->tops.size(); j++)
         {
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             int top_blob_index = layer->tops[j];
 
             layer->top_shapes[j] = blobs[top_blob_index].shape;
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
 //             fprintf(stderr, "%d %4d %4d %4d | %2d %s\n", blobs[top_blob_index].shape.dims, blobs[top_blob_index].shape.w, blobs[top_blob_index].shape.h, blobs[top_blob_index].shape.c, top_blob_index, blobs[top_blob_index].name.c_str());
         }
@@ -2703,11 +2732,11 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     // const char* outbin = argv[4];
     // int flag = atoi(argv[5]);
     
-    FakeFile stderr;
     // char *error_buf;
     // size_t error_size;
     // // redirect stderr
     // stderr = open_memstream(&error_buf, &error_size);
+    stderr.Open();
 
     NetOptimize optimizer;
 
@@ -2806,6 +2835,7 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     // std::string outbin(bp_ptr, bp_size);
     std::string error_str = stderr.CloseAndGetStr();
     std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+    std::cout << "error: " << error_str << std::endl;
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
     std::cout << __FILE__ << " " <<  __LINE__ << std::endl;

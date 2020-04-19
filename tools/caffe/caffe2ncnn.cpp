@@ -39,7 +39,7 @@
 
 #define stderr fake_stderr_caffe
 
-FILE *fake_stderr_caffe;
+FakeFile fake_stderr_caffe;
 
 namespace caffe = caffe_ncnn;
 
@@ -311,7 +311,8 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     // const char* quantize_param = argc >= 6 ? argv[5] : "0";
     // const char* int8scale_table_path = argc == 7 ? argv[6] : NULL;
 
-    FakeFile pp, bp, fake_stderr_caffe;
+    FakeFile pp, bp;
+    stderr.Open();
     // char *error_buf;
     // size_t error_size;
     // // redirect stderr

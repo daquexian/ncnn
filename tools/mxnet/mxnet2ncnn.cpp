@@ -22,6 +22,14 @@
 #include <string>
 #include <vector>
 
+#include <wmc_utils.h>
+
+#include "mxnet2ncnn.h"
+
+#define stderr fake_stderr_mxnet
+
+FakeFile fake_stderr_mxnet;
+
 class MXNetParam;
 class MXNetNode
 {
@@ -304,12 +312,13 @@ static void parse_input_list(const char* s, std::vector<int>& inputs, std::vecto
     }
 }
 
-static bool read_mxnet_json(const char* jsonpath, std::vector<MXNetNode>& nodes)
+static bool read_mxnet_json(const char* buf, const size_t buflen, std::vector<MXNetNode>& nodes)
 {
-    FILE* fp = fopen(jsonpath, "rb");
+    // FILE* fp = fopen(jsonpath, "rb");
+    FILE* fp = fmemopen(const_cast<char *>(buf), buflen, "rb");
     if (!fp)
     {
-        fprintf(stderr, "fopen %s failed\n", jsonpath);
+        fprintf(stderr, "fopen mxnet json failed\n");
         return false;
     }
 
@@ -322,7 +331,7 @@ static bool read_mxnet_json(const char* jsonpath, std::vector<MXNetNode>& nodes)
     char* s = fgets(line, 1024, fp);
     if (!s)
     {
-        fprintf(stderr, "fgets %s failed\n", jsonpath);
+        fprintf(stderr, "fgets mxnet json failed\n");
         return false;
     }
 
@@ -550,12 +559,13 @@ static bool read_mxnet_json(const char* jsonpath, std::vector<MXNetNode>& nodes)
     return true;
 }
 
-static bool read_mxnet_param(const char* parampath, std::vector<MXNetParam>& params)
+static bool read_mxnet_param(const char* buf, const size_t buflen, std::vector<MXNetParam>& params)
 {
-    FILE* fp = fopen(parampath, "rb");
+    // FILE* fp = fopen(parampath, "rb");
+    FILE* fp = fmemopen(const_cast<char *>(buf), buflen, "rb");
     if (!fp)
     {
-        fprintf(stderr, "fopen %s failed\n", parampath);
+        fprintf(stderr, "fopen mxnet param failed\n");
         return false;
     }
 
@@ -924,25 +934,24 @@ static void fuse_hardsigmoid_hardswish(std::vector<MXNetNode>& nodes, std::vecto
     }
 }
 
-tl::expected<NcnnModel, std::string> mxnet2ncnn(const std::string &nodes_str, const std::string &params_str) {
+tl::expected<NcnnModel, std::string> mxnet2ncnn(const std::string &nodes_str, const std::string &params_str)
 {
     // const char* jsonpath = argv[1];
     // const char* parampath = argv[2];
     // const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.param";
     // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
-    char *error_buf;
-    size_t error_size;
-    // redirect stderr
-    fake_stderr_caffe = open_memstream(&error_buf, &error_size);
+    stderr.Open();
 
     std::vector<MXNetNode> nodes;
     std::vector<MXNetParam> params;
 
-    read_mxnet_json(jsonpath, nodes);
-    read_mxnet_param(parampath, params);
+    read_mxnet_json(nodes_str.c_str(), nodes_str.size(), nodes);
+    read_mxnet_param(params_str.c_str(), params_str.size(), params);
 
-    FILE* pp = fopen(ncnn_prototxt, "wb");
-    FILE* bp = fopen(ncnn_modelbin, "wb");
+    FakeFile pp, bp;
+
+    // FILE* pp = fopen(ncnn_prototxt, "wb");
+    // FILE* bp = fopen(ncnn_modelbin, "wb");
 
     // magic
     fprintf(pp, "7767517\n");
@@ -2632,8 +2641,15 @@ tl::expected<NcnnModel, std::string> mxnet2ncnn(const std::string &nodes_str, co
         }
     }
 
-    fclose(pp);
-    fclose(bp);
+    // fclose(pp);
+    // fclose(bp);
+    //
+    // fclose(fake_stderr_mxnet);
 
-    return 0;
+    std::string error_str = stderr.CloseAndGetStr();
+
+    // replace newline to html <br/>
+    error_str = ReplaceAll(error_str, "\n", "<br/>");
+
+    return std::make_tuple(pp.CloseAndGetStr(), bp.CloseAndGetStr(), error_str);
 }
