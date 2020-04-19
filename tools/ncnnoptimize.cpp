@@ -152,7 +152,7 @@ public:
     int fwrite_weight_tag_data(int tag, const ncnn::Mat& data, FILE* bp);
     int fwrite_weight_data(const ncnn::Mat& data, FILE* bp);
 
-    int save(char **pp_ptr, size_t *pp_size, char **bp_ptr, size_t *bp_size);
+    int save(FILE *pp, FILE *bp);
 
 #if defined(__aarch64__) && defined(LINUX)
     void gauss_random(ncnn::Mat &m);
@@ -1943,13 +1943,10 @@ int NetOptimize::fwrite_weight_data(const ncnn::Mat& data, FILE* bp)
     return 0;
 }
 
-int NetOptimize::save(char **pp_ptr, size_t *pp_size, char **bp_ptr, size_t *bp_size)
+int NetOptimize::save(FILE *pp, FILE *bp)
 {
     // FILE* pp = fopen(parampath, "wb");
     // FILE* bp = fopen(binpath, "wb");
-
-    FILE *pp = open_memstream (pp_ptr, pp_size);
-    FILE *bp = open_memstream (bp_ptr, bp_size);
 
     fprintf(pp, "7767517\n");
 
@@ -2672,8 +2669,8 @@ int NetOptimize::save(char **pp_ptr, size_t *pp_size, char **bp_ptr, size_t *bp_
         delete layer_default;
     }
 
-    fclose(pp);
-    fclose(bp);
+    // fclose(pp);
+    // fclose(bp);
 
     return 0;
 }
@@ -2705,10 +2702,12 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     // const char* outparam = argv[3];
     // const char* outbin = argv[4];
     // int flag = atoi(argv[5]);
-    char *error_buf;
-    size_t error_size;
-    // redirect stderr
-    stderr = open_memstream(&error_buf, &error_size);
+    
+    FakeFile stderr;
+    // char *error_buf;
+    // size_t error_size;
+    // // redirect stderr
+    // stderr = open_memstream(&error_buf, &error_size);
 
     NetOptimize optimizer;
 
@@ -2722,63 +2721,100 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     }
 
     // load_param mem version
-    int s1 = optimizer.load_param_mem(reinterpret_cast<const char *>(inparam));
+    int err1 = optimizer.load_param_mem(reinterpret_cast<const char *>(inparam));
     std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
-    std::cout << s1 << std::endl;
+    std::cout << err1 << std::endl;
+    if (err1) {
+        return tl::make_unexpected("load param failed in ncnnoptimize");
+    }
     // if (strcmp(inbin, "null") == 0)
     // {
     //     DataReaderFromEmpty dr;
     //     optimizer.load_model(dr);
     // }
     // else
-    int s2 = optimizer.load_model(inbin);
+    int err2 = optimizer.load_model(inbin);
+    if (!err2) {
+        return tl::make_unexpected("load param failed in ncnnoptimize");
+    }
     std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
-    std::cout << s2 << std::endl;
+    std::cout << err2 << std::endl;
 
 #if defined(__aarch64__) && defined(LINUX)
     optimizer.find_fastest_fp32_conv(dataname, inw, inh, inc);
 #endif // defined(__aarch64__) && defined(LINUX)
     optimizer.fuse_batchnorm_scale();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_convolution_batchnorm();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_convolutiondepthwise_batchnorm();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_deconvolution_batchnorm();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_deconvolutiondepthwise_batchnorm();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_innerproduct_batchnorm();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_innerproduct_dropout();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_convolution_activation();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_convolutiondepthwise_activation();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_deconvolution_activation();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_deconvolutiondepthwise_activation();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_innerproduct_activation();
 
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_dropout();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_pooling1x1();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_noop();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_flatten_after_global_pooling();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_reshape_after_global_pooling();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_reshape_before_binaryop();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.replace_convolution_with_innerproduct_after_global_pooling();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.replace_convolution_with_innerproduct_after_innerproduct();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.eliminate_flatten_after_innerproduct();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_orphaned_memorydata();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.shape_inference();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
-    char *pp_ptr, *bp_ptr;
-    size_t pp_size, bp_size;
+    // char *pp_ptr, *bp_ptr;
+    // size_t pp_size, bp_size;
+    FakeFile pp, bp;
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
-    optimizer.save(&pp_ptr, &pp_size, &bp_ptr, &bp_size);
+    optimizer.save(pp, bp);
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
-    fclose(stderr);
-    std::string outparam(pp_ptr, pp_size);
-    std::string outbin(bp_ptr, bp_size);
-    std::string error_str(error_buf, error_size);
+    // std::string outparam(pp_ptr, pp_size);
+    // std::string outbin(bp_ptr, bp_size);
+    std::string error_str = stderr.CloseAndGetStr();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
-    return std::make_tuple(std::vector<char>(outparam.begin(), outparam.end()),
-            std::vector<char>(outbin.begin(), outbin.end()),
+    auto pp_str = pp.CloseAndGetStr();
+    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+    auto bp_str = bp.CloseAndGetStr();
+
+    return std::make_tuple(pp_str,
+            bp_str,
             error_str);
 }

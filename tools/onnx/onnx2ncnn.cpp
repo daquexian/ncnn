@@ -199,23 +199,18 @@ static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
     return 0;
 }
 
-static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, std::vector<char> &bp)
+static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, FILE* bp)
 {
     int size = get_tensor_proto_data_size(tp);
 
     if (tp.has_raw_data())
     {
         const std::string& raw_data = tp.raw_data();
-        for (const auto &x : raw_data) {
-            bp.push_back(x);
-        }
+        fwrite(raw_data.data(), sizeof(float), size, bp);
     }
     else if (tp.data_type() == 1)
     {
-        const auto *data = reinterpret_cast<const char *>(tp.float_data().data());
-        for (size_t i = 0; i < sizeof(float) * size; i++) {
-            bp.push_back(data[i]);
-        }
+        fwrite(tp.float_data().data(), sizeof(float), size, bp);
     }
 }
 
@@ -1125,12 +1120,12 @@ static void fuse_pixelshuffle(onnx::GraphProto* mutable_graph, std::map<std::str
 
 tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
 {
-    std::vector<char> pp;
-    std::vector<char> bp;
-    char *error_buf;
-    size_t error_size;
-    // redirect stderr
-    fake_stderr = open_memstream(&error_buf, &error_size);
+
+    FakeFile pp, bp, fake_stderr;
+    // char *error_buf;
+    // size_t error_size;
+    // // redirect stderr
+    // fake_stderr = open_memstream(&error_buf, &error_size);
 
     onnx::ModelProto model;
     bool s1 = model.ParseFromString(model_str);
@@ -3176,11 +3171,10 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
             }
         }
     }
-    fclose(stderr);
-    std::string error_str(error_buf, error_size);
+    std::string error_str = fake_stderr.CloseAndGetStr();
 
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
 
-    return std::make_tuple(pp, bp, error_str);
+    return std::make_tuple(pp.CloseAndGetStr(), bp.CloseAndGetStr(), error_str);
 }

@@ -310,10 +310,12 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
     // const char* quantize_param = argc >= 6 ? argv[5] : "0";
     // const char* int8scale_table_path = argc == 7 ? argv[6] : NULL;
-    char *error_buf;
-    size_t error_size;
-    // redirect stderr
-    fake_stderr_caffe = open_memstream(&error_buf, &error_size);
+
+    FakeFile pp, bp, fake_stderr_caffe;
+    // char *error_buf;
+    // size_t error_size;
+    // // redirect stderr
+    // fake_stderr_caffe = open_memstream(&error_buf, &error_size);
 
     const char* ncnn_prototxt = "ncnn.proto";
     const char* ncnn_modelbin = "ncnn.bin";
@@ -349,9 +351,6 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
             return tl::make_unexpected("read_int8scale_table failed");
         }
     }
-
-    std::vector<char> pp;
-    std::vector<char> bp;
 
     // magic
     fprintf(pp, "7767517\n");
@@ -1698,11 +1697,10 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
         }
 
     }
-    fclose(stderr);
-    std::string error_str(error_buf, error_size);
+    std::string error_str = fake_stderr_caffe.CloseAndGetStr();
 
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
 
-    return std::make_tuple(pp, bp, error_str);
+    return std::make_tuple(pp.CloseAndGetStr(), bp.CloseAndGetStr(), error_str);
 }
