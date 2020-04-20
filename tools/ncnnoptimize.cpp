@@ -2704,7 +2704,7 @@ int NetOptimize::save(FILE *pp, FILE *bp)
     return 0;
 }
 
-tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, const unsigned char *inbin, int flag)
+tl::expected<NcnnModel, std::string> ncnnoptimize(void **inparam, void **inbin, int flag)
 {
 #if !defined(__EMSCRIPTEN__)
 #if defined(__aarch64__) && defined(LINUX)
@@ -2750,7 +2750,9 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     }
 
     // load_param mem version
-    int err1 = optimizer.load_param_mem(reinterpret_cast<const char *>(inparam));
+    int err1 = optimizer.load_param_mem(reinterpret_cast<const char *>(*inparam));
+    free(*inparam);
+    *inparam = nullptr;
     std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     std::cout << err1 << std::endl;
     if (err1) {
@@ -2762,7 +2764,9 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     //     optimizer.load_model(dr);
     // }
     // else
-    int err2 = optimizer.load_model(inbin);
+    int err2 = optimizer.load_model(static_cast<unsigned char *>(*inbin));
+    free(*inbin);
+    *inbin = nullptr;
     if (!err2) {
         return tl::make_unexpected("load param failed in ncnnoptimize");
     }
@@ -2840,11 +2844,7 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(const unsigned char *inparam, 
     error_str = ReplaceAll(error_str, "\n", "<br/>");
     std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
-    auto pp_str = pp.CloseAndGetStr();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
-    auto bp_str = bp.CloseAndGetStr();
-
-    return std::make_tuple(pp_str,
-            bp_str,
+    return std::make_tuple(pp.CloseAndGetBuf(),
+            bp.CloseAndGetBuf(),
             error_str);
 }

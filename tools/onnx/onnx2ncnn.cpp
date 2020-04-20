@@ -1118,7 +1118,7 @@ static void fuse_pixelshuffle(onnx::GraphProto* mutable_graph, std::map<std::str
 // }
 // }
 
-tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
+tl::expected<NcnnModel, std::string> onnx2ncnn(void **buf, size_t buflen)
 {
 
     FakeFile pp, bp, fake_stderr;
@@ -1128,7 +1128,9 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
     // fake_stderr = open_memstream(&error_buf, &error_size);
 
     onnx::ModelProto model;
-    bool s1 = model.ParseFromString(model_str);
+    bool s1 = model.ParseFromArray(*buf, buflen);
+    free(*buf);
+    *buf = nullptr;
 
     // load
     if (!s1)
@@ -3176,5 +3178,5 @@ tl::expected<NcnnModel, std::string> onnx2ncnn(const std::string &model_str)
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
 
-    return std::make_tuple(pp.CloseAndGetStr(), bp.CloseAndGetStr(), error_str);
+    return std::make_tuple(pp.CloseAndGetBuf(), bp.CloseAndGetBuf(), error_str);
 }

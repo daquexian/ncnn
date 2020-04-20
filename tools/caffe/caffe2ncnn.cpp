@@ -305,41 +305,51 @@ static bool quantize_weight(float *data, size_t data_length, int quantize_level,
 // }
 // }
 //
-tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str, const std::string &model_str) {
-    // const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.proto";
-    // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
-    // const char* quantize_param = argc >= 6 ? argv[5] : "0";
-    // const char* int8scale_table_path = argc == 7 ? argv[6] : NULL;
+tl::expected<NcnnModel, std::string> caffe2ncnn(void** txt_buf,
+                                                const size_t txt_len,
+                                                void** model_buf,
+                                                const size_t model_len) {
+  // const char* ncnn_prototxt = argc >= 5 ? argv[3] : "ncnn.proto";
+  // const char* ncnn_modelbin = argc >= 5 ? argv[4] : "ncnn.bin";
+  // const char* quantize_param = argc >= 6 ? argv[5] : "0";
+  // const char* int8scale_table_path = argc == 7 ? argv[6] : NULL;
 
-    FakeFile pp, bp;
-    stderr.Open();
-    // char *error_buf;
-    // size_t error_size;
-    // // redirect stderr
-    // fake_stderr_caffe = open_memstream(&error_buf, &error_size);
+  FakeFile pp, bp;
+  stderr.Open();
+  // char *error_buf;
+  // size_t error_size;
+  // // redirect stderr
+  // fake_stderr_caffe = open_memstream(&error_buf, &error_size);
 
-    const char* ncnn_prototxt = "ncnn.proto";
-    const char* ncnn_modelbin = "ncnn.bin";
-    const char* quantize_param = "0";
-    const char* int8scale_table_path = NULL;
-    int quantize_level = atoi(quantize_param);
+  const char* ncnn_prototxt = "ncnn.proto";
+  const char* ncnn_modelbin = "ncnn.bin";
+  const char* quantize_param = "0";
+  const char* int8scale_table_path = NULL;
+  int quantize_level = atoi(quantize_param);
 
-    if (quantize_level != 0 && quantize_level != 256 && quantize_level != 65536) {
-        return tl::make_unexpected("only support quantize level = 0, 256, or 65536");
-    }
+  if (quantize_level != 0 && quantize_level != 256 && quantize_level != 65536) {
+    return tl::make_unexpected(
+        "only support quantize level = 0, 256, or 65536");
+  }
 
-    caffe::NetParameter proto;
-    caffe::NetParameter net;
+  caffe::NetParameter proto;
+  caffe::NetParameter net;
+  const std::string prototxt_str(
+      reinterpret_cast<const char *>(*txt_buf), txt_len);
     bool s0 = google::protobuf::TextFormat::ParseFromString(prototxt_str, &proto);
-    bool s1 = net.ParseFromString(model_str);
+    bool s1 = net.ParseFromArray(*model_buf, model_len);
+    free(*model_buf);
+    free(*txt_buf);
+    *model_buf = nullptr;
+    *txt_buf = nullptr;
 
     if (!s0)
     {
-        return tl::make_unexpected("Unable to parse prototxt: " + prototxt_str);
+        return tl::make_unexpected("Unable to parse prototxt");
     }
     if (!s1)
     {
-        return tl::make_unexpected("Unable to parse caffemodel " + std::to_string(model_str.size()));
+        return tl::make_unexpected("Unable to parse caffemodel ");
     }
 
     std::map<std::string, std::vector<float> > blob_int8scale_table;
@@ -1703,5 +1713,5 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(const std::string &prototxt_str,
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
 
-    return std::make_tuple(pp.CloseAndGetStr(), bp.CloseAndGetStr(), error_str);
+    return std::make_tuple(pp.CloseAndGetBuf(), bp.CloseAndGetBuf(), error_str);
 }

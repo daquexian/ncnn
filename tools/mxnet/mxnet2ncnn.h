@@ -1,4 +1,7 @@
 #include <expected.hpp>
 #include <wmc_utils.h>
 
-tl::expected<NcnnModel, std::string> mxnet2ncnn(const std::string &nodes_str, const std::string &params_str);
+tl::expected<NcnnModel, std::string> mxnet2ncnn(void** nodes_buf,
+                                                const size_t nodes_len,
+                                                void** params_buf,
+                                                const size_t params_len);
