@@ -1,7 +1,7 @@
-
 # add_subdirectory(caffe)
 # add_subdirectory(mxnet)
 # add_subdirectory(onnx)
+# add_subdirectory(darknet)
 #
 # add_subdirectory(quantize)
 #
@@ -13,7 +13,6 @@
 #     target_link_libraries(ncnn2mem PRIVATE ${Vulkan_LIBRARY})
 # endif()
 #
-# add_executable(ncnnoptimize ncnnoptimize.cpp)
 add_library(ncnnoptimize ncnnoptimize.cpp)
 
 target_link_libraries(ncnnoptimize ncnn)

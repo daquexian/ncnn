@@ -121,43 +121,50 @@ std::string MXNetNode::attr_s(const char* key) const {
   return it->second;
 }
 
-std::vector<int> MXNetNode::attr_ai(const char* key) const {
-  const std::map<std::string, std::string>::const_iterator it = attrs.find(key);
-  if (it == attrs.end()) return std::vector<int>();
+std::vector<int> MXNetNode::attr_ai(const char* key) const
+{
+    const std::map<std::string, std::string>::const_iterator it = attrs.find(key);
+    if (it == attrs.end())
+        return std::vector<int>();
 
-  // (1,2,3)
-  std::vector<int> list;
+    // (1,2,3)
+    std::vector<int> list;
 
-  int i = 0;
-  int c = 0;
-  int nconsumed = 0;
-  int nscan = sscanf(it->second.c_str() + c, "%*[(,]%d%n", &i, &nconsumed);
-  if (nscan != 1) {
-    // (None
-    if (strncmp(it->second.c_str() + c, "(None", 5) == 0) {
-      i = -233;
-      nconsumed = 5;
-      nscan = 1;
+    int i = 0;
+    int c = 0;
+    int nconsumed = 0;
+    int nscan = sscanf(it->second.c_str() + c, "%*[\[(,]%d%n", &i, &nconsumed);
+    if (nscan != 1)
+    {
+        // (None
+        if (strncmp(it->second.c_str() + c, "(None", 5) == 0)
+        {
+            i = -233;
+            nconsumed = 5;
+            nscan = 1;
+        }
     }
-  }
-  while (nscan == 1) {
-    list.push_back(i);
-    //         fprintf(stderr, "%d\n", i);
+    while (nscan == 1)
+    {
+        list.push_back(i);
+//         fprintf(stderr, "%d\n", i);
 
-    i = 0;
-    c += nconsumed;
-    nscan = sscanf(it->second.c_str() + c, "%*[(,]%d%n", &i, &nconsumed);
-    if (nscan != 1) {
-      // , None
-      if (strncmp(it->second.c_str() + c, ", None", 6) == 0) {
-        i = -233;
-        nconsumed = 6;
-        nscan = 1;
-      }
+        i = 0;
+        c += nconsumed;
+        nscan = sscanf(it->second.c_str() + c, "%*[(,]%d%n", &i, &nconsumed);
+        if (nscan != 1)
+        {
+            // , None
+            if (strncmp(it->second.c_str() + c, ", None", 6) == 0)
+            {
+                i = -233;
+                nconsumed = 6;
+                nscan = 1;
+            }
+        }
     }
-  }
 
-  return list;
+    return list;
 }
 
 std::vector<float> MXNetNode::attr_af(const char* key) const {

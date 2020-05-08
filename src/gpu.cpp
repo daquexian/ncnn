@@ -27,6 +27,13 @@
 #include <vector>
 
 #include "mat.h"
+#include "command.h"
+#include "layer_type.h"
+#include "layer.h"
+
+#include "command.h"
+
+#include "layer/vulkan/packing_vulkan.h"
 
 #if __ANDROID__
 #define ENABLE_VALIDATION_LAYER 0
@@ -603,6 +610,10 @@ int create_gpu_instance()
         gpu_info.memory_map_alignment = physicalDeviceProperties.limits.minMemoryMapAlignment;
         gpu_info.buffer_offset_alignment = physicalDeviceProperties.limits.minStorageBufferOffsetAlignment;
         gpu_info.non_coherent_atom_size = physicalDeviceProperties.limits.nonCoherentAtomSize;
+        gpu_info.buffer_image_granularity = physicalDeviceProperties.limits.bufferImageGranularity;
+        gpu_info.max_image_dimension_1d = physicalDeviceProperties.limits.maxImageDimension1D;
+        gpu_info.max_image_dimension_2d = physicalDeviceProperties.limits.maxImageDimension2D;
+        gpu_info.max_image_dimension_3d = physicalDeviceProperties.limits.maxImageDimension3D;
 
         gpu_info.timestamp_period = physicalDeviceProperties.limits.timestampPeriod;
 
@@ -771,8 +782,9 @@ int create_gpu_instance()
             {
                 gpu_info.support_int8_storage = query8BitStorageFeatures.storageBuffer8BitAccess && query8BitStorageFeatures.uniformAndStorageBuffer8BitAccess;
             }
-            if (gpu_info.support_VK_KHR_16bit_storage)
+            if (gpu_info.support_VK_KHR_16bit_storage && queryFeatures.features.shaderStorageImageExtendedFormats)
             {
+                // shaderStorageImageExtendedFormats enables r16f format in storage image
                 gpu_info.support_fp16_storage = query16BitStorageFeatures.storageBuffer16BitAccess && query16BitStorageFeatures.uniformAndStorageBuffer16BitAccess;
             }
             if (gpu_info.support_VK_KHR_shader_float16_int8)
@@ -833,7 +845,7 @@ int create_gpu_instance()
     // resolve shader info
     for (int i=0; i<layer_shader_registry_entry_count; i++)
     {
-        layer_shader_infos[i] = resolve_shader_info(layer_shader_registry[i].spv_data, layer_shader_registry[i].spv_data_size);
+        resolve_shader_info(layer_shader_registry[i].spv_data, layer_shader_registry[i].spv_data_size, layer_shader_infos[i]);
     }
 
     return 0;
@@ -1043,8 +1055,8 @@ VulkanDevice::VulkanDevice(int device_index) : info(g_gpu_infos[device_index])
     for (uint32_t i = 0; i < info.compute_queue_count; i++)
     {
         vkGetDeviceQueue(device, info.compute_queue_family_index, i, &compute_queues[i]);
-        blob_allocators[i] = new VkBlobBufferAllocator(this);
-        staging_allocators[i] = new VkStagingBufferAllocator(this);
+        blob_allocators[i] = new VkBlobAllocator(this);
+        staging_allocators[i] = new VkStagingAllocator(this);
     }
     if (info.compute_queue_family_index != info.graphics_queue_family_index)
     {
@@ -1062,10 +1074,53 @@ VulkanDevice::VulkanDevice(int device_index) : info(g_gpu_infos[device_index])
             vkGetDeviceQueue(device, info.transfer_queue_family_index, i, &transfer_queues[i]);
         }
     }
+
+    // prepare immutable texelfetch sampler
+    {
+        VkSamplerCreateInfo samplerCreateInfo;
+        samplerCreateInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerCreateInfo.pNext = 0;
+        samplerCreateInfo.flags = 0;
+        samplerCreateInfo.magFilter = VK_FILTER_NEAREST;
+        samplerCreateInfo.minFilter = VK_FILTER_NEAREST;
+        samplerCreateInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCreateInfo.mipLodBias = 0.0f;
+        samplerCreateInfo.anisotropyEnable = VK_FALSE;
+        samplerCreateInfo.maxAnisotropy = 1;
+        samplerCreateInfo.compareEnable = VK_FALSE;
+        samplerCreateInfo.compareOp = VK_COMPARE_OP_NEVER;
+        samplerCreateInfo.minLod = 0.0f;
+        samplerCreateInfo.maxLod = 0.0f;
+        samplerCreateInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        samplerCreateInfo.unnormalizedCoordinates = VK_TRUE;
+
+        texelfetch_sampler = 0;
+        ret = vkCreateSampler(device, &samplerCreateInfo, 0, &texelfetch_sampler);
+        if (ret != VK_SUCCESS)
+        {
+            fprintf(stderr, "vkCreateSampler failed %d\n", ret);
+        }
+    }
+
+    create_dummy_buffer_image();
+
+    create_utility_operator();
 }
 
 VulkanDevice::~VulkanDevice()
 {
+    destroy_utility_operator();
+
+    destroy_dummy_buffer_image();
+
+    if (texelfetch_sampler)
+    {
+        vkDestroySampler(device, texelfetch_sampler, 0);
+    }
+
     for (uint32_t i = 0; i < info.compute_queue_count; i++)
     {
         delete blob_allocators[i];
@@ -1436,40 +1491,67 @@ void VulkanDevice::reclaim_staging_allocator(VkAllocator* allocator) const
     fprintf(stderr, "FATAL ERROR! reclaim_staging_allocator get wild allocator %p\n", allocator);
 }
 
-static inline bool string_ends_with_fp16p(const char* name)
+const VkSampler* VulkanDevice::immutable_texelfetch_sampler() const
 {
-    int len = strlen(name);
-    if (len < 6)
-        return false;
-
-    return memcmp(name + len - 6, "_fp16p", 6) == 0;
+    return &texelfetch_sampler;
 }
 
-static inline bool string_ends_with_fp16pa(const char* name)
+VkMat VulkanDevice::get_dummy_buffer() const
 {
-    int len = strlen(name);
-    if (len < 7)
-        return false;
-
-    return memcmp(name + len - 7, "_fp16pa", 7) == 0;
+    return dummy_buffer;
 }
 
-static inline bool string_ends_with_fp16s(const char* name)
+VkImageMat VulkanDevice::get_dummy_image() const
 {
-    int len = strlen(name);
-    if (len < 6)
-        return false;
-
-    return memcmp(name + len - 6, "_fp16s", 6) == 0;
+    return dummy_image;
 }
 
-static inline bool string_ends_with_fp16sa(const char* name)
+void VulkanDevice::convert_packing(const VkMat& src, VkMat& dst, int dst_elempack, VkCompute& cmd, const Option& opt) const
 {
-    int len = strlen(name);
-    if (len < 7)
-        return false;
+    int cast_type_from_index = src.elemsize == src.elempack * 4u ? 0 : opt.use_fp16_storage ? 2 : 1;
+    int cast_type_to_index = opt.use_fp16_storage ? 2 : opt.use_fp16_packed && dst_elempack % 4 == 0 ? 1 : 0;
+    int packing_type_to_index = dst_elempack == 1 ? 0 : dst_elempack == 4 ? 1 : 2;
 
-    return memcmp(name + len - 7, "_fp16sa", 7) == 0;
+//     fprintf(stderr, "convert_packing b2b %d %d %d\n", cast_type_from_index, cast_type_to_index, packing_type_to_index);
+
+    const ncnn::Packing_vulkan* uop = uop_packing[0][0][cast_type_from_index][cast_type_to_index][packing_type_to_index];
+    uop->forward(src, dst, cmd, opt);
+}
+
+void VulkanDevice::convert_packing(const VkImageMat& src, VkImageMat& dst, int dst_elempack, VkCompute& cmd, const Option& opt) const
+{
+    int cast_type_from_index = src.elemsize == src.elempack * 4u ? 0 : opt.use_fp16_storage ? 2 : 1;
+    int cast_type_to_index = opt.use_fp16_storage ? 2 : opt.use_fp16_packed && dst_elempack % 4 == 0 ? 1 : 0;
+    int packing_type_to_index = dst_elempack == 1 ? 0 : dst_elempack == 4 ? 1 : 2;
+
+//     fprintf(stderr, "convert_packing i2i %d %d %d\n", cast_type_from_index, cast_type_to_index, packing_type_to_index);
+
+    const ncnn::Packing_vulkan* uop = uop_packing[1][1][cast_type_from_index][cast_type_to_index][packing_type_to_index];
+    uop->forward(src, dst, cmd, opt);
+}
+
+void VulkanDevice::convert_packing(const VkMat& src, VkImageMat& dst, int dst_elempack, VkCompute& cmd, const Option& opt) const
+{
+    int cast_type_from_index = src.elemsize == src.elempack * 4u ? 0 : opt.use_fp16_storage ? 2 : 1;
+    int cast_type_to_index = opt.use_fp16_storage ? 2 : opt.use_fp16_packed && dst_elempack % 4 == 0 ? 1 : 0;
+    int packing_type_to_index = dst_elempack == 1 ? 0 : dst_elempack == 4 ? 1 : 2;
+
+//     fprintf(stderr, "convert_packing b2i %d %d %d\n", cast_type_from_index, cast_type_to_index, packing_type_to_index);
+
+    const ncnn::Packing_vulkan* uop = uop_packing[0][1][cast_type_from_index][cast_type_to_index][packing_type_to_index];
+    uop->forward(src, dst, cmd, opt);
+}
+
+void VulkanDevice::convert_packing(const VkImageMat& src, VkMat& dst, int dst_elempack, VkCompute& cmd, const Option& opt) const
+{
+    int cast_type_from_index = src.elemsize == src.elempack * 4u ? 0 : opt.use_fp16_storage ? 2 : 1;
+    int cast_type_to_index = opt.use_fp16_storage ? 2 : opt.use_fp16_packed && dst_elempack % 4 == 0 ? 1 : 0;
+    int packing_type_to_index = dst_elempack == 1 ? 0 : dst_elempack == 4 ? 1 : 2;
+
+//     fprintf(stderr, "convert_packing i2b %d %d %d\n", cast_type_from_index, cast_type_to_index, packing_type_to_index);
+
+    const ncnn::Packing_vulkan* uop = uop_packing[1][0][cast_type_from_index][cast_type_to_index][packing_type_to_index];
+    uop->forward(src, dst, cmd, opt);
 }
 
 int VulkanDevice::create_shader_module()
@@ -1490,28 +1572,56 @@ int VulkanDevice::create_shader_module()
         // 2 = fp16pa
         // 3 = fp16s
         // 4 = fp16sa
+        // 5 = image
+        // 6 = image_fp16p
+        // 7 = image_fp16s
+        // 8 = image_fp16a
 
         if (!info.support_fp16_packed)
         {
-            if (i % 5 == 1)
+            if (i % 9 == 1)
                 continue;
         }
 
         if (!info.support_fp16_packed || !info.support_fp16_arithmetic)
         {
-            if (i % 5 == 2)
+            if (i % 9 == 2)
                 continue;
         }
 
         if (!info.support_fp16_storage)
         {
-            if (i % 5 == 3)
+            if (i % 9 == 3)
                 continue;
         }
 
         if (!info.support_fp16_storage || !info.support_fp16_arithmetic)
         {
-            if (i % 5 == 4)
+            if (i % 9 == 4)
+                continue;
+        }
+
+//         if (!info.support_image_storage)
+//         {
+//             if (i % 9 == 5)
+//                 continue;
+//         }
+
+        if (!info.support_fp16_packed)
+        {
+            if (i % 9 == 6)
+                continue;
+        }
+
+        if (!info.support_fp16_storage)
+        {
+            if (i % 9 == 7)
+                continue;
+        }
+
+        if (!info.support_fp16_storage || !info.support_fp16_arithmetic)
+        {
+            if (i % 9 == 8)
                 continue;
         }
 
@@ -1606,6 +1716,240 @@ int VulkanDevice::init_device_extension()
     return 0;
 }
 
+class VkDummyAllocator : public VkBlobAllocator
+{
+public:
+    VkDummyAllocator(const VulkanDevice* _vkdev) : VkBlobAllocator(_vkdev)
+    {
+        // NOTE 16k is large enough I think ...
+        block_size = alignSize(16 * 1024, buffer_offset_alignment);
+    }
+};
+
+class VkDummyCompute : public VkCompute
+{
+public:
+    VkDummyCompute(const VulkanDevice* _vkdev) : VkCompute(_vkdev) {}
+
+    void record_dummy(const VkMat& buffer)
+    {
+//         fprintf(stderr, "xxx barrier buffer %p +%d ~%d\n", buffer.buffer(), buffer.buffer_offset(), buffer.buffer_capacity());
+
+        // barrier device any @ compute/null to shader-readwrite @ compute
+        VkBufferMemoryBarrier* barriers = new VkBufferMemoryBarrier[1];
+        barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barriers[0].pNext = 0;
+        barriers[0].srcAccessMask = buffer.data->access_flags;
+        barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[0].buffer = buffer.buffer();
+        barriers[0].offset = buffer.buffer_offset();
+        barriers[0].size = buffer.buffer_capacity();
+
+        VkPipelineStageFlags src_stage = buffer.data->stage_flags;
+        VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+        if (vkdev->info.support_VK_KHR_push_descriptor)
+        {
+            vkCmdPipelineBarrier(compute_command_buffer, src_stage, dst_stage, 0, 0, 0, 1, barriers, 0, 0);
+            delete[] barriers;
+        }
+        else
+        {
+            record r;
+            r.type = record::TYPE_buffer_barrers;
+            r.command_buffer = compute_command_buffer;
+            r.buffer_barrers.src_stage = src_stage;
+            r.buffer_barrers.dst_stage = dst_stage;
+            r.buffer_barrers.barrier_count = 1;
+            r.buffer_barrers.barriers = barriers;
+            delayed_records.push_back(r);
+        }
+
+        // mark device shader-readwrite @ compute
+        buffer.data->access_flags = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        buffer.data->stage_flags = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+
+    void record_dummy(const VkImageMat& image)
+    {
+//         fprintf(stderr, "xxx barrier image %p +%d ~%d %p\n", image.image(), image.data->bind_offset, image.data->bind_capacity, image.imageview());
+
+        // image layout transform any @ any to shader-write @ compute
+        VkImageMemoryBarrier* barriers = new VkImageMemoryBarrier[1];
+        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barriers[0].pNext = 0;
+        barriers[0].srcAccessMask = image.data->access_flags;
+        barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[0].oldLayout = image.data->image_layout;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[0].image = image.image();
+        barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barriers[0].subresourceRange.baseMipLevel = 0;
+        barriers[0].subresourceRange.levelCount = 1;
+        barriers[0].subresourceRange.baseArrayLayer = 0;
+        barriers[0].subresourceRange.layerCount = 1;
+
+        VkPipelineStageFlags src_stage = image.data->stage_flags;
+        VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+        if (vkdev->info.support_VK_KHR_push_descriptor)
+        {
+            vkCmdPipelineBarrier(compute_command_buffer, src_stage, dst_stage, 0, 0, 0, 0, 0, 1, barriers);
+            delete[] barriers;
+        }
+        else
+        {
+            record r;
+            r.type = record::TYPE_image_barrers;
+            r.command_buffer = compute_command_buffer;
+            r.image_barrers.src_stage = src_stage;
+            r.image_barrers.dst_stage = dst_stage;
+            r.image_barrers.barrier_count = 1;
+            r.image_barrers.barriers = barriers;
+            delayed_records.push_back(r);
+        }
+
+        // mark image shader-write @ compute
+        image.data->access_flags = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        image.data->image_layout = VK_IMAGE_LAYOUT_GENERAL;
+        image.data->stage_flags = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+};
+
+int VulkanDevice::create_dummy_buffer_image()
+{
+    dummy_allocator = new VkDummyAllocator(this);
+
+    dummy_buffer.create(1, 4u, dummy_allocator);
+    dummy_image.create(1, 4u, dummy_allocator);
+
+    VkDummyCompute cmd(this);
+
+    cmd.record_dummy(dummy_buffer);
+    cmd.record_dummy(dummy_image);
+
+    cmd.submit_and_wait();
+
+    return 0;
+}
+
+void VulkanDevice::destroy_dummy_buffer_image()
+{
+    dummy_buffer.release();
+    dummy_image.release();
+
+    delete dummy_allocator;
+}
+
+int VulkanDevice::create_utility_operator()
+{
+    memset(uop_packing, 0, sizeof(uop_packing));
+
+    Option opt;
+
+    // from buffer | image
+    // to buffer | image
+    for (int i0=0; i0<2; i0++)
+    {
+    for (int i1=0; i1<2; i1++)
+    {
+        opt.use_image_storage = (i0 == 1 || i1 == 1);
+
+        // from fp32-b/i | fp16p-b/i | fp16s-b/i
+        // to fp32-b/i | fp16p-b/i | fp16s-b/i
+        for (int j0=0; j0<3; j0++)
+        {
+        for (int j1=0; j1<3; j1++)
+        {
+            opt.use_fp16_packed = (j0 == 1 || j1 == 1);
+            opt.use_fp16_storage = (j0 == 2 || j1 == 2);
+
+            if (!info.support_fp16_packed && opt.use_fp16_packed)
+                continue;
+
+            if (!info.support_fp16_storage && opt.use_fp16_storage)
+                continue;
+
+            // from pack1 | pack4 | pack8
+            for (int k=0; k<3; k++)
+            {
+                // enable pack8 for pack8to1/pack8to4
+                opt.use_shader_pack8 = true;
+
+                ncnn::Packing_vulkan* uop = new ncnn::Packing_vulkan;
+                uop->vkdev = this;
+
+                ncnn::ParamDict pd;
+                pd.set(0, k == 0 ? 1 : k == 1 ? 4 : 8);// out_elempack
+                pd.set(2, j0 + 1);// cast_type_from  0=auto 1=fp32 2=fp16p 3=fp16s
+                pd.set(3, j1 + 1);// cast_type_to
+                pd.set(4, i0);// storage_type_from  0=buffer 1=image
+                pd.set(5, i1);// storage_type_to
+
+                uop->load_param(pd);
+
+                uop->create_pipeline(opt);
+
+                uop_packing[i0][i1][j0][j1][k] = uop;
+            }
+        }
+        }
+    }
+    }
+
+    return 0;
+}
+
+void VulkanDevice::destroy_utility_operator()
+{
+    Option opt;
+
+    // from buffer | image
+    // to buffer | image
+    for (int i0=0; i0<2; i0++)
+    {
+    for (int i1=0; i1<2; i1++)
+    {
+        opt.use_image_storage = (i0 == 1 || i1 == 1);
+
+        // from fp32-b/i | fp16p-b/i | fp16s-b/i
+        // to fp32-b/i | fp16p-b/i | fp16s-b/i
+        for (int j0=0; j0<3; j0++)
+        {
+        for (int j1=0; j1<3; j1++)
+        {
+            opt.use_fp16_packed = (j0 == 1 || j1 == 1);
+            opt.use_fp16_storage = (j0 == 2 || j1 == 2);
+
+            if (!info.support_fp16_packed && opt.use_fp16_packed)
+                continue;
+
+            if (!info.support_fp16_storage && opt.use_fp16_storage)
+                continue;
+
+            // from pack1 | pack4 | pack8
+            for (int k=0; k<3; k++)
+            {
+                opt.use_shader_pack8 = (k == 2 || k == 2);
+
+                ncnn::Layer* uop = uop_packing[i0][i1][j0][j1][k];
+
+                uop->destroy_pipeline(opt);
+
+                delete uop;
+
+                uop_packing[i0][i1][j0][j1][k] = 0;
+            }
+        }
+        }
+    }
+    }
+}
+
 VulkanDevice* get_gpu_device(int device_index)
 {
     if (device_index < 0 || device_index >= g_gpu_count)
@@ -1630,15 +1974,29 @@ const ShaderInfo& get_shader_info(int shader_type_index)
     return layer_shader_infos[shader_type_index];
 }
 
-ShaderInfo resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size)
+int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderInfo& shader_info)
 {
+    shader_info.specialization_count = 0;
+    shader_info.binding_count = 0;
+    shader_info.push_constant_count = 0;
+
     uint32_t parameter_id = -233;
 
     int specialization_count = 0;
     int binding_count = 0;
     int push_constant_count = 0;
 
+    // id -> binding_type
+    std::vector<int> id_types;
+
+    // binding_id -> binding_type
+    std::vector<int> binding_types;
+
     const uint32_t* p = spv_data;
+
+    int bound = p[3];
+
+    id_types.resize(bound);
 
     // skip magic version generator bound schema
     p += 5;
@@ -1668,28 +2026,86 @@ ShaderInfo resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size)
                 push_constant_count++;
             }
         }
+        else if (op == 25) // OpTypeImage
+        {
+            uint32_t id = p[1];
+            id_types[id] = 2;
+        }
+        else if (op == 27) // OpTypeSampledImage
+        {
+            uint32_t id = p[1];
+            id_types[id] = 3;
+        }
+        else if (op == 32) // OpTypePointer
+        {
+            uint32_t id = p[1];
+            uint32_t storage_class = p[2];
+            uint32_t type = p[3];
+            if (storage_class == 0) // UniformConstant
+            {
+                id_types[id] = id_types[type];
+            }
+            if (storage_class == 2) // Uniform
+            {
+                id_types[id] = id_types[type];
+            }
+        }
+        else if (op == 59) // OpVariable
+        {
+            uint32_t id = p[1];
+            uint32_t var_id = p[2];
+            uint32_t storage_class = p[3];
+            if (storage_class == 0) // UniformConstant
+            {
+                id_types[var_id] = id_types[id];
+            }
+            if (storage_class == 2) // Uniform
+            {
+                id_types[var_id] = id_types[id];
+            }
+        }
         else if (op == 71) // OpDecorate
         {
+            uint32_t id = p[1];
             uint32_t decoration = p[2];
+            uint32_t binding_id = p[3];
             if (decoration == 1) // SpecId
             {
                 specialization_count++;
             }
+            if (decoration == 3) // BufferBlock
+            {
+                id_types[id] = 1;
+            }
             else if (decoration == 33) // Binding
             {
-                binding_count++;
+                binding_count = std::max(binding_count, (int)binding_id + 1);
+
+                binding_types.resize(binding_count);
+                binding_types[binding_id] = id;
             }
         }
 
         p += wordcount;
     }
 
-    ShaderInfo si;
-    si.specialization_count = specialization_count;
-    si.binding_count = binding_count;
-    si.push_constant_count = push_constant_count;
+    if (binding_count > 16)
+    {
+        fprintf(stderr, "too many binding %d\n", binding_count);
+        return -1;
+    }
 
-    return si;
+    shader_info.specialization_count = specialization_count;
+    shader_info.binding_count = binding_count;
+    shader_info.push_constant_count = push_constant_count;
+
+    // resolve binding_types
+    for (int i=0; i<binding_count; i++)
+    {
+        shader_info.binding_types[i] = id_types[ binding_types[i] ];
+    }
+
+    return 0;
 }
 
 } // namespace ncnn
