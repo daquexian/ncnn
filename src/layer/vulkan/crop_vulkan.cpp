@@ -102,22 +102,7 @@ int Crop_vulkan::create_pipeline(const Option& opt)
 
     size_t elemsize;
     size_t out_elemsize;
-    if (opt.use_image_storage && opt.use_fp16_storage)
-    {
-        elemsize = elempack * 2u;
-        out_elemsize = out_elempack * 2u;
-    }
-    else if (opt.use_image_storage && opt.use_fp16_packed)
-    {
-        elemsize = elempack == 1 ? 4u : elempack * 2u;
-        out_elemsize = out_elempack == 1 ? 4u : out_elempack * 2u;
-    }
-    else if (opt.use_image_storage)
-    {
-        elemsize = elempack * 4u;
-        out_elemsize = out_elempack * 4u;
-    }
-    else if (opt.use_fp16_storage)
+    if (opt.use_fp16_storage)
     {
         elemsize = elempack * 2u;
         out_elemsize = out_elempack * 2u;
@@ -147,19 +132,7 @@ int Crop_vulkan::create_pipeline(const Option& opt)
     if (bottom_shapes.size() == 1 && shape.dims != 0 && elempack == out_elempack && elempack > offset_elempack)
     {
         size_t offset_elemsize;
-        if (opt.use_image_storage && opt.use_fp16_storage)
-        {
-            offset_elemsize = offset_elempack * 2u;
-        }
-        else if (opt.use_image_storage && opt.use_fp16_packed)
-        {
-            offset_elemsize = offset_elempack == 1 ? 4u : offset_elempack * 2u;
-        }
-        else if (opt.use_image_storage)
-        {
-            offset_elemsize = offset_elempack * 4u;
-        }
-        else if (opt.use_fp16_storage)
+        if (opt.use_fp16_storage)
         {
             offset_elemsize = offset_elempack * 2u;
         }
@@ -177,17 +150,18 @@ int Crop_vulkan::create_pipeline(const Option& opt)
         if (shape.dims == 3) shape_unpacked = Mat(shape.w, shape.h, shape.c / offset_elempack, (void*)0, offset_elemsize, offset_elempack);
     }
 
-    std::vector<vk_specialization_type> specializations(0 + 10);
-    specializations[0 + 0].i = shape_unpacked.dims;
-    specializations[0 + 1].i = shape_unpacked.w;
-    specializations[0 + 2].i = shape_unpacked.h;
-    specializations[0 + 3].i = shape_unpacked.c;
-    specializations[0 + 4].i = shape_unpacked.cstep;
-    specializations[0 + 5].i = out_shape_packed.dims;
-    specializations[0 + 6].i = out_shape_packed.w;
-    specializations[0 + 7].i = out_shape_packed.h;
-    specializations[0 + 8].i = out_shape_packed.c;
-    specializations[0 + 9].i = out_shape_packed.cstep;
+    std::vector<vk_specialization_type> specializations(1 + 10);
+    specializations[0].i = vkdev->info.bug_implicit_fp16_arithmetic;
+    specializations[1 + 0].i = shape_unpacked.dims;
+    specializations[1 + 1].i = shape_unpacked.w;
+    specializations[1 + 2].i = shape_unpacked.h;
+    specializations[1 + 3].i = shape_unpacked.c;
+    specializations[1 + 4].i = shape_unpacked.cstep;
+    specializations[1 + 5].i = out_shape_packed.dims;
+    specializations[1 + 6].i = out_shape_packed.w;
+    specializations[1 + 7].i = out_shape_packed.h;
+    specializations[1 + 8].i = out_shape_packed.c;
+    specializations[1 + 9].i = out_shape_packed.cstep;
 
     Mat local_size_xyz;
     if (out_shape_packed.dims == 1)
@@ -284,7 +258,7 @@ int Crop_vulkan::create_pipeline(const Option& opt)
     return 0;
 }
 
-int Crop_vulkan::destroy_pipeline(const Option& opt)
+int Crop_vulkan::destroy_pipeline(const Option& /*opt*/)
 {
     delete pipeline_crop;
     pipeline_crop = 0;
@@ -318,9 +292,6 @@ int Crop_vulkan::destroy_pipeline(const Option& opt)
 
 int Crop_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
-    int w = bottom_blob.w;
-    int h = bottom_blob.h;
-    int channels = bottom_blob.c;
     int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
@@ -443,8 +414,6 @@ int Crop_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkM
     const VkMat& bottom_blob = bottom_blobs[0];
     const VkMat& reference_blob = bottom_blobs[1];
 
-    int h = bottom_blob.h;
-    int channels = bottom_blob.c;
     int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
@@ -573,9 +542,6 @@ int Crop_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkM
 
 int Crop_vulkan::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
-    int w = bottom_blob.w;
-    int h = bottom_blob.h;
-    int channels = bottom_blob.c;
     int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
@@ -698,8 +664,6 @@ int Crop_vulkan::forward(const std::vector<VkImageMat>& bottom_blobs, std::vecto
     const VkImageMat& bottom_blob = bottom_blobs[0];
     const VkImageMat& reference_blob = bottom_blobs[1];
 
-    int h = bottom_blob.h;
-    int channels = bottom_blob.c;
     int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;

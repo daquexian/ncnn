@@ -35,25 +35,14 @@ Packing_vulkan::Packing_vulkan()
     pipeline_packing_pack8to1 = 0;
 }
 
-int Packing_vulkan::create_pipeline(const Option& opt)
+int Packing_vulkan::create_pipeline(const Option& _opt)
 {
+    Option opt = _opt;
     const Mat& shape = bottom_shapes.empty() ? Mat() : bottom_shapes[0];
     const Mat& out_shape = top_shapes.empty() ? Mat() : top_shapes[0];
 
     size_t out_elemsize;
-    if (opt.use_image_storage && opt.use_fp16_storage)
-    {
-        out_elemsize = out_elempack * 2u;
-    }
-    else if (opt.use_image_storage && opt.use_fp16_packed)
-    {
-        out_elemsize = out_elempack == 1 ? 4u : out_elempack * 2u;
-    }
-    else if (opt.use_image_storage)
-    {
-        out_elemsize = out_elempack * 4u;
-    }
-    else if (opt.use_fp16_storage)
+    if (opt.use_fp16_storage)
     {
         out_elemsize = out_elempack * 2u;
     }
@@ -76,6 +65,13 @@ int Packing_vulkan::create_pipeline(const Option& opt)
     if (out_shape.dims == 1) out_shape_packed = Mat(out_shape.w / out_elempack, (void*)0, out_elemsize, out_elempack);
     if (out_shape.dims == 2) out_shape_packed = Mat(out_shape.w, out_shape.h / out_elempack, (void*)0, out_elemsize, out_elempack);
     if (out_shape.dims == 3) out_shape_packed = Mat(out_shape.w, out_shape.h, out_shape.c / out_elempack, (void*)0, out_elemsize, out_elempack);
+
+    // check blob shape
+    if (!vkdev->shape_support_image_storage(out_shape_packed))
+    {
+        support_image_storage = false;
+        opt.use_image_storage = false;
+    }
 
     std::vector<vk_specialization_type> specializations(2 + 10);
     specializations[0].i = storage_type_from;
@@ -242,7 +238,7 @@ int Packing_vulkan::destroy_pipeline(const Option& /*opt*/)
 int Packing_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
     int elempack = bottom_blob.elempack;
-//     fprintf(stderr, "Packing_vulkan b2b %d %d   %d %d   %d %d\n", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
+//     NCNN_LOGE("Packing_vulkan b2b %d %d   %d %d   %d %d", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
 
     if (elempack == out_elempack && cast_type_from == cast_type_to && bottom_blob.allocator == opt.blob_vkallocator)
     {
@@ -357,9 +353,10 @@ int Packing_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
     buffer_bindings[1] = top_blob;
 
     std::vector<VkImageMat> image_bindings(2);
-
     if (!opt.use_image_storage)
+    {
         image_bindings.clear();
+    }
 
     std::vector<vk_constant_type> constants(10);
     constants[0].i = bottom_blob.dims;
@@ -416,7 +413,7 @@ int Packing_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
 int Packing_vulkan::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
     int elempack = bottom_blob.elempack;
-//     fprintf(stderr, "Packing_vulkan i2i %d %d   %d %d   %d %d\n", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
+//     NCNN_LOGE("Packing_vulkan i2i %d %d   %d %d   %d %d", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
 
     if (elempack == out_elempack && cast_type_from == cast_type_to && bottom_blob.allocator == opt.blob_vkallocator)
     {
@@ -577,7 +574,7 @@ int Packing_vulkan::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob,
 int Packing_vulkan::forward(const VkMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
     int elempack = bottom_blob.elempack;
-//     fprintf(stderr, "Packing_vulkan b2i %d %d   %d %d   %d %d\n", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
+//     NCNN_LOGE("Packing_vulkan b2i %d %d   %d %d   %d %d", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
@@ -588,7 +585,7 @@ int Packing_vulkan::forward(const VkMat& bottom_blob, VkImageMat& top_blob, VkCo
 //     if (!use_padding)
 //     {
 //         // identity if use_padding not allowed
-//         fprintf(stderr, "buffer to mat use_padding not allowed\n");
+//         NCNN_LOGE("buffer to mat use_padding not allowed");
 //         return -1;
 //     }
 
@@ -719,7 +716,7 @@ int Packing_vulkan::forward(const VkMat& bottom_blob, VkImageMat& top_blob, VkCo
 int Packing_vulkan::forward(const VkImageMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
     int elempack = bottom_blob.elempack;
-//     fprintf(stderr, "Packing_vulkan i2b %d %d   %d %d   %d %d\n", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
+//     NCNN_LOGE("Packing_vulkan i2b %d %d   %d %d   %d %d", elempack, out_elempack, cast_type_from, cast_type_to, storage_type_from, storage_type_to);
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
@@ -730,7 +727,7 @@ int Packing_vulkan::forward(const VkImageMat& bottom_blob, VkMat& top_blob, VkCo
 //     if (!use_padding)
 //     {
 //         // identity if use_padding not allowed
-//         fprintf(stderr, "buffer to mat use_padding not allowed\n");
+//         NCNN_LOGE("buffer to mat use_padding not allowed");
 //         return -1;
 //     }
 

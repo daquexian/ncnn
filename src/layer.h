@@ -15,9 +15,6 @@
 #ifndef NCNN_LAYER_H
 #define NCNN_LAYER_H
 
-#include <stdio.h>
-#include <string>
-#include <vector>
 #include <math.h>
 #include "platform.h"
 #include "mat.h"

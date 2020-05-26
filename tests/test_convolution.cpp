@@ -29,7 +29,7 @@ static int test_convolution(int w, int h, int c, int outch, int kernel, int dila
     pd.set(5, bias);// bias_term
     pd.set(6, outch*c*kernel*kernel);
 
-    int activation_type = RAND() % 5;// 0 1 2 3 4
+    int activation_type = RAND() % 6;// 0 1 2 3 4 5
     ncnn::Mat activation_params(2);
     activation_params[0] = RandomFloat(-1, 0);// alpha
     activation_params[1] = RandomFloat(0, 1);// beta
@@ -61,19 +61,19 @@ static int test_convolution_0()
         {1, 1, 1, 0},
         {1, 1, 2, 0},
         {2, 1, 1, 1},
-        {2, 1, 2, 1},
+        {2, 1, 2, -233},
         {3, 1, 1, 1},
         {3, 1, 2, 1},
         {3, 2, 1, 1},
         {4, 1, 1, 2},
-        {4, 1, 2, 2},
-        {4, 2, 1, 2},
-        {5, 1, 1, 2},
+        {4, 1, 2, -233},
+        {4, 2, 1, -234},
+        {5, 1, 1, -234},
         {5, 1, 2, 2},
         {5, 2, 2, 2},
         {7, 1, 1, 3},
         {7, 1, 2, 3},
-        {7, 2, 1, 3},
+        {7, 2, 1, -233},
     };
 
     for (int i=0; i<16; i++)
