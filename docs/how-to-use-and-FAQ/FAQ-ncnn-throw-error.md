@@ -39,7 +39,7 @@ You may implement them as custom layer followed in [how-to-implement-custom-laye
 
 Or you could simply register them as no-op if you are sure those operations make no sense.
 
-```
+```cpp
 class Noop : public ncnn::Layer {};
 DEFINE_LAYER_CREATOR(Noop)
 
@@ -93,3 +93,14 @@ For recent ndk >= 21
 ```
 -fstatic-openmp
 ```
+
+### dlopen failed: library "libomp.so" not found
+
+Newer android ndk defaults to dynamic openmp runtime
+
+modify the link flags as
+
+```
+-fstatic-openmp -fopenmp
+```
+
