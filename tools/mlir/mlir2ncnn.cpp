@@ -12,6 +12,8 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#include "mlir2ncnn.h"
+
 #include <stdio.h>
 
 #include <map>
@@ -57,6 +59,16 @@
 #include "tf_attributes.h"
 #include "tf_side_effects.h"
 #include "tf_traits.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
+#include <dqx_helper.h>
+#include <wmc_utils.h>
+
+#define stderr fake_stderr_mlir
+FakeFile fake_stderr_mlir;
 
 namespace mlir {
 
@@ -586,17 +598,18 @@ static std::vector<float> get_operation_attr_af(const mlir::Operation& _operatio
     return get_attr_af(attr);
 }
 
-int main(int argc, char** argv)
-{
-    const char* mlirpath = argv[1];
-    const char* ncnn_prototxt = argc >= 4 ? argv[2] : "ncnn.param";
-    const char* ncnn_modelbin = argc >= 4 ? argv[3] : "ncnn.bin";
+tl::expected<NcnnModel, std::string> mlir2ncnn(void **buf, size_t buflen) {
+    // const char* mlirpath = argv[1];
+    // const char* ncnn_prototxt = argc >= 4 ? argv[2] : "ncnn.param";
+    // const char* ncnn_modelbin = argc >= 4 ? argv[3] : "ncnn.bin";
 
     mlir::registerDialect<mlir::StandardOpsDialect>();
     mlir::registerDialect<mlir::TF::TensorFlowDialect>();
 
     mlir::MLIRContext context;
-    mlir::OwningModuleRef m = mlir::parseSourceFile(mlirpath, &context);
+    mlir::OwningModuleRef m = mlir::parseSourceString(std::string(static_cast<char*>(*buf), buflen), &context);
+    free(*buf);
+    *buf = nullptr;
 
     //     m->dump();
 
@@ -606,8 +619,10 @@ int main(int argc, char** argv)
 
     //     bb.dump();
 
-    FILE* pp = fopen(ncnn_prototxt, "wb");
-    FILE* bp = fopen(ncnn_modelbin, "wb");
+    // FILE* pp = fopen(ncnn_prototxt, "wb");
+    // FILE* bp = fopen(ncnn_modelbin, "wb");
+    FakeFile pp, bp;
+    stderr.Open();
 
     // node reference
     std::map<std::string, int> node_reference;
@@ -1773,8 +1788,12 @@ int main(int argc, char** argv)
         }
     }
 
-    fclose(pp);
-    fclose(bp);
+    // fclose(pp);
+    // fclose(bp);
+    std::string error_str = stderr.CloseAndGetStr();
 
-    return 0;
+    // replace newline to html <br/>
+    error_str = ReplaceAll(error_str, "\n", "<br/>");
+
+    return std::make_tuple(pp.CloseAndGetBuf(), bp.CloseAndGetBuf(), error_str);
 }
