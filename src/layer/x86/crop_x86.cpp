@@ -18,8 +18,6 @@
 
 #include "crop_x86.h"
 
-#include <algorithm>
-
 namespace ncnn {
 
 Crop_x86::Crop_x86()
@@ -57,14 +55,15 @@ static void crop_pack8_avx(const Mat& src, Mat& dst, int top, int left)
 
 int Crop_x86::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
+    int elempack = bottom_blob.elempack;
+
+#if __AVX__
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
     int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
-    int elempack = bottom_blob.elempack;
 
-#if __AVX__
     if (elempack == 8)
     {
         int _woffset, _hoffset, _coffset;
@@ -174,18 +173,18 @@ int Crop_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
     const Mat& bottom_blob = bottom_blobs[0];
     const Mat& reference_blob = bottom_blobs[1];
 
+    int elempack = bottom_blob.elempack;
+
+    int ref_elempack = reference_blob.elempack;
+
+#if __AVX__
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
     int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
-    int elempack = bottom_blob.elempack;
-
-    int ref_elempack = reference_blob.elempack;
-
     Mat& top_blob = top_blobs[0];
 
-#if __AVX__
     if (elempack == 8)
     {
         int _woffset, _hoffset, _coffset;

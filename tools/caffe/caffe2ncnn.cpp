@@ -1514,7 +1514,7 @@ tl::expected<NcnnModel, std::string> caffe2ncnn(void** txt_buf,
             }
             else if (bs.dim_size() == 3)
             {
-                fprintf(pp, " 0=%zd 1=%zd 2=-233", size_t(bs.dim(2)), bs.dim(1));
+                fprintf(pp, " 0=%zd 1=%zd 2=-233", size_t(bs.dim(2)), size_t(bs.dim(1)));
             }
             else // bs.dim_size() == 4
             {

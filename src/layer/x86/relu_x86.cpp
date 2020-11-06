@@ -11,7 +11,6 @@
 // under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
-#include <algorithm>
 
 #if __AVX__
 #include "avx_activation.h"
@@ -34,9 +33,10 @@ int ReLU_x86::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
     int h = bottom_top_blob.h;
     int channels = bottom_top_blob.c;
     int size = w * h;
-    int elempack = bottom_top_blob.elempack;
 
 #if __AVX__
+    int elempack = bottom_top_blob.elempack;
+
     if (elempack == 8)
     {
         if (slope == 0.f)
@@ -60,7 +60,6 @@ int ReLU_x86::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
-                __m256 _zero = _mm256_set1_ps(0.f);
                 for (int i = 0; i < size; i++)
                 {
                     __m256 _p = _mm256_loadu_ps(ptr);

@@ -54,43 +54,35 @@ Interp_arm::Interp_arm()
     support_bf16_storage = true;
 }
 
-int Interp_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int elembits = bottom_blob.elembits();
 
 #if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
     if (opt.use_fp16_storage && elembits == 16)
     {
         if (opt.use_fp16_arithmetic)
-            return forward_fp16sa(bottom_blob, top_blob, opt);
+            return forward_fp16sa(bottom_blobs, top_blobs, opt);
         else
-            return forward_fp16s(bottom_blob, top_blob, opt);
+            return forward_fp16s(bottom_blobs, top_blobs, opt);
     }
 #endif
 
     if (opt.use_bf16_storage && elembits == 16)
-        return forward_bf16s(bottom_blob, top_blob, opt);
+        return forward_bf16s(bottom_blobs, top_blobs, opt);
 
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
-    {
-        return Interp::forward(bottom_blob, top_blob, opt);
-    }
-
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
+    int outh = reference_blob.h;
+    int outw = reference_blob.w;
 
     if (outh == h && outw == w)
     {
@@ -269,28 +261,20 @@ int Interp_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt
 }
 
 #if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-int Interp_arm::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward_fp16s(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
-    {
-        return Interp::forward(bottom_blob, top_blob, opt);
-    }
-
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
+    int outh = reference_blob.h;
+    int outw = reference_blob.w;
 
     if (outh == h && outw == w)
     {
@@ -466,28 +450,20 @@ int Interp_arm::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Optio
     return 0;
 }
 
-int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward_fp16sa(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
-    {
-        return Interp::forward(bottom_blob, top_blob, opt);
-    }
-
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
+    int outh = reference_blob.h;
+    int outw = reference_blob.w;
 
     if (outh == h && outw == w)
     {
@@ -749,28 +725,20 @@ int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Opti
 }
 #endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 
-int Interp_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward_bf16s(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
-    {
-        return Interp::forward(bottom_blob, top_blob, opt);
-    }
-
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
+    int outh = reference_blob.h;
+    int outw = reference_blob.w;
 
     if (outh == h && outw == w)
     {
