@@ -260,7 +260,7 @@ tl::expected<NcnnModel, std::string> mlir2ncnn(void **buf, size_t buflen) {
     // const char* ncnn_prototxt = argc >= 4 ? argv[2] : "ncnn.param";
     // const char* ncnn_modelbin = argc >= 4 ? argv[3] : "ncnn.bin";
 
-    mlir::MLIRContext context(/*loadAllDialects=*/false);
+    mlir::MLIRContext context;
 
     context.getOrLoadDialect<mlir::StandardOpsDialect>();
     context.getOrLoadDialect<mlir::TF::TensorFlowDialect>();
