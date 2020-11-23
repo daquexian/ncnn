@@ -3,14 +3,14 @@ project(mlir2ncnn)
 cmake_minimum_required(VERSION 3.10)
 set(CMAKE_CXX_STANDARD 14)
 
-set(CMAKE_FIND_ROOT_PATH "/home/dev/files/repos/llvm-project/build-wasm/install/")
-set(LLVM_DIR "/home/dev/files/repos/llvm-project/build-wasm/install/lib/cmake/llvm")
+set(CMAKE_FIND_ROOT_PATH "/home/dev/files/repos/llvm-project/build-wasm-release-8d0fdd/install/")
+set(LLVM_DIR "/home/dev/files/repos/llvm-project/build-wasm-release-8d0fdd/install/lib/cmake/llvm")
 find_package(LLVM REQUIRED)
 
-set(MLIR_DIR "/home/dev/files/repos/llvm-project/build-wasm/install/lib/cmake/mlir")
+set(MLIR_DIR "/home/dev/files/repos/llvm-project/build-wasm-release-8d0fdd/install/lib/cmake/mlir")
 find_package(MLIR REQUIRED)
 
-include_directories("/home/dev/files/repos/llvm-project/build-wasm/install/include")
+include_directories("/home/dev/files/repos/llvm-project/build-wasm-release-8d0fdd/install/include")
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 

@@ -266,7 +266,6 @@ tl::expected<NcnnModel, std::string> mlir2ncnn(void **buf, size_t buflen) {
     context.getOrLoadDialect<mlir::TF::TensorFlowDialect>();
     context.getOrLoadDialect<mlir::ncnn::NCNNDialect>();
 
-    mlir::MLIRContext context;
     mlir::OwningModuleRef m = mlir::parseSourceString(std::string(static_cast<char*>(*buf), buflen), &context);
     free(*buf);
     *buf = nullptr;
