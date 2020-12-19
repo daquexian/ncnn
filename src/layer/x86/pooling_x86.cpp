@@ -1,49 +1,53 @@
-// Tencent is pleased to support the open source community by making ncnn
-// available.
+// Tencent is pleased to support the open source community by making ncnn available.
 //
 // Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
 //
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this
-// file except in compliance with the License. You may obtain a copy of the
-// License at
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
+// in compliance with the License. You may obtain a copy of the License at
 //
 // https://opensource.org/licenses/BSD-3-Clause
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// License for the specific language governing permissions and limitations under
-// the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+// CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
 
+#include "pooling_x86.h"
+
+#if __SSE2__
 #if __AVX__
 #include <immintrin.h>
 #endif
-#include "pooling_x86.h"
+#endif // __SSE2__
+
 #include <float.h>
 
 namespace ncnn {
 
+#if __SSE2__
 #if __AVX__
 #include "pooling_2x2.h"
 #include "pooling_2x2_pack8.h"
 #include "pooling_3x3_pack8.h"
 #endif
+#endif // __SSE2__
 
 Pooling_x86::Pooling_x86()
 {
-#if __AVX__
+#if __SSE2__
     support_packing = true;
-#endif // __AVX__
+#endif // __SSE2__
 }
 
-int Pooling_x86::forward(const Mat& bottom_blob, Mat& top_blob,
-                         const Option& opt) const
+int Pooling_x86::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
     // max value in NxN window
     // avg value in NxN window
 
-#if __AVX__
+#if __SSE2__
     int elempack = bottom_blob.elempack;
+
+#if __AVX__
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
@@ -284,6 +288,19 @@ int Pooling_x86::forward(const Mat& bottom_blob, Mat& top_blob,
         return 0;
     }
 #endif // __AVX__
+
+    if (elempack == 4)
+    {
+        // TODO implement pack4
+        Mat bottom_blob_unpacked;
+
+        Option opt_pack = opt;
+        opt_pack.blob_allocator = opt.workspace_allocator;
+        convert_packing(bottom_blob, bottom_blob_unpacked, 1, opt_pack);
+
+        return forward(bottom_blob_unpacked, top_blob, opt);
+    }
+#endif // __SSE2__
 
     if (kernel_w != kernel_h || stride_w != stride_h)
     {

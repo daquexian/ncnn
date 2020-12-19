@@ -30,6 +30,11 @@ using ncnn::Option;
 extern "C" {
 #endif
 
+const char* ncnn_version()
+{
+    return NCNN_VERSION_STRING;
+}
+
 /* mat api */
 ncnn_mat_t ncnn_mat_create()
 {
@@ -111,6 +116,8 @@ void* ncnn_mat_get_data(ncnn_mat_t mat)
     return ((Mat*)mat)->data;
 }
 
+#if NCNN_PIXEL
+
 /* mat pixel api */
 ncnn_mat_t ncnn_mat_from_pixels(const unsigned char* pixels, int type, int w, int h, int stride)
 {
@@ -131,6 +138,8 @@ void ncnn_mat_to_pixels_resize(ncnn_mat_t mat, unsigned char* pixels, int type, 
 {
     ((Mat*)mat)->to_pixels_resize(pixels, type, target_width, target_height, target_stride);
 }
+
+#endif
 
 void ncnn_mat_substract_mean_normalize(ncnn_mat_t mat, const float* mean_vals, const float* norm_vals)
 {
@@ -184,6 +193,7 @@ const char* ncnn_blob_get_name(ncnn_blob_t blob)
 #if NCNN_STRING
     return ((Blob*)blob)->name.c_str();
 #else
+    (void)blob;
     return "";
 #endif
 }
@@ -218,6 +228,7 @@ const char* ncnn_layer_get_name(ncnn_layer_t layer)
 #if NCNN_STRING
     return ((Layer*)layer)->name.c_str();
 #else
+    (void)layer;
     return "";
 #endif
 }
@@ -232,6 +243,7 @@ const char* ncnn_layer_get_type(ncnn_layer_t layer)
 #if NCNN_STRING
     return ((Layer*)layer)->type.c_str();
 #else
+    (void)layer;
     return "";
 #endif
 }
@@ -295,6 +307,8 @@ int ncnn_net_load_param(ncnn_net_t net, const char* path)
 #if NCNN_STDIO && NCNN_STRING
     return ((Net*)net)->load_param(path);
 #else
+    (void)path;
+    (void)net;
     return -1;
 #endif
 }
@@ -304,6 +318,8 @@ int ncnn_net_load_model(ncnn_net_t net, const char* path)
 #if NCNN_STDIO && NCNN_STRING
     return ((Net*)net)->load_model(path);
 #else
+    (void)path;
+    (void)net;
     return -1;
 #endif
 }
@@ -352,6 +368,9 @@ int ncnn_extractor_input(ncnn_extractor_t ex, const char* name, ncnn_mat_t mat)
 #if NCNN_STRING
     return ((Extractor*)ex)->input(name, *((Mat*)mat));
 #else
+    (void)ex;
+    (void)name;
+    (void)mat;
     return -1;
 #endif
 }
@@ -364,6 +383,9 @@ int ncnn_extractor_extract(ncnn_extractor_t ex, const char* name, ncnn_mat_t* ma
     *mat = (ncnn_mat_t)(new Mat(mat0));
     return ret;
 #else
+    (void)ex;
+    (void)name;
+    (void)mat;
     return -1;
 #endif
 }

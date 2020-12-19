@@ -147,10 +147,10 @@ protected:
 #if NCNN_STRING
     int find_blob_index_by_name(const char* name) const;
     int find_layer_index_by_name(const char* name) const;
-    int custom_layer_to_index(const char* type);
-    Layer* create_custom_layer(const char* type);
+    virtual int custom_layer_to_index(const char* type);
+    virtual Layer* create_custom_layer(const char* type);
 #endif // NCNN_STRING
-    Layer* create_custom_layer(int index);
+    virtual Layer* create_custom_layer(int index);
     int forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const;
 
 #if NCNN_VULKAN
@@ -209,7 +209,9 @@ public:
 
     // get result by blob name
     // return 0 if success
-    int extract(const char* blob_name, Mat& feat);
+    // type = 0, default
+    // type = 1, do not convert fp16/bf16 or / and packing
+    int extract(const char* blob_name, Mat& feat, int type = 0);
 #endif // NCNN_STRING
 
     // set input by blob index
@@ -218,7 +220,9 @@ public:
 
     // get result by blob index
     // return 0 if success
-    int extract(int blob_index, Mat& feat);
+    // type = 0, default
+    // type = 1, do not convert fp16/bf16 or / and packing
+    int extract(int blob_index, Mat& feat, int type = 0);
 
 #if NCNN_VULKAN
 #if NCNN_STRING

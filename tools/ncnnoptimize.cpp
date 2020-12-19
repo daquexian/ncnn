@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <vector>
 #include <iostream>
@@ -24,6 +25,7 @@
 // ncnn public header
 #include "datareader.h"
 #include "layer.h"
+#include "layer_type.h"
 #include "net.h"
 
 // ncnn private header
@@ -119,8 +121,106 @@ public:
     }
 };
 
+class MemoryFootprintAllocator : public ncnn::Allocator
+{
+public:
+    MemoryFootprintAllocator()
+    {
+        current_memory_usage = 0;
+        memory_footprint = 0;
+    }
+
+    virtual void* fastMalloc(size_t size)
+    {
+        ncnn::MutexLockGuard g(lock);
+        void* ptr = ncnn::fastMalloc(size);
+        bookkeeper[ptr] = size;
+        current_memory_usage += size;
+        memory_footprint = std::max(memory_footprint, current_memory_usage);
+        return ptr;
+    }
+
+    virtual void fastFree(void* ptr)
+    {
+        ncnn::MutexLockGuard g(lock);
+        size_t size = bookkeeper[ptr];
+        current_memory_usage -= size;
+        bookkeeper.erase(bookkeeper.find(ptr));
+        ncnn::fastFree(ptr);
+    }
+
+public:
+    int current_memory_usage;
+    int memory_footprint;
+    ncnn::Mutex lock;
+    std::map<void*, size_t> bookkeeper;
+};
+
+class CustomLayer : public ncnn::Layer
+{
+public:
+    virtual int load_param(const ncnn::ParamDict& pd)
+    {
+        mpd = pd;
+        return 0;
+    }
+
+    void write_param(FILE* pp)
+    {
+        for (int i = 0; i < NCNN_MAX_PARAM_COUNT; i++)
+        {
+            int type = mpd.type(i);
+            if (type == 0)
+                continue;
+
+            if (type == 2)
+            {
+                fprintf(pp, " %d=%d", i, mpd.get(i, 0));
+            }
+            if (type == 3)
+            {
+                fprintf(pp, " %d=%e", i, mpd.get(i, 0.f));
+            }
+            if (type == 5)
+            {
+                ncnn::Mat v = mpd.get(i, ncnn::Mat());
+                int len = v.w;
+                fprintf(pp, " %d=%d", -i - 23300, len);
+                const int* p = v;
+                for (int j = 0; j < len; j++)
+                {
+                    fprintf(pp, ",%d", p[j]);
+                }
+            }
+            if (type == 6)
+            {
+                ncnn::Mat v = mpd.get(i, ncnn::Mat());
+                int len = v.w;
+                fprintf(pp, " %d=%d", -i - 23300, len);
+                const float* p = v;
+                for (int j = 0; j < len; j++)
+                {
+                    fprintf(pp, ",%e", p[j]);
+                }
+            }
+        }
+    }
+
+public:
+    ncnn::ParamDict mpd;
+};
+
 class NetOptimize : public ncnn::Net
 {
+public:
+    NetOptimize();
+
+    virtual int custom_layer_to_index(const char* type);
+    virtual ncnn::Layer* create_custom_layer(const char* type);
+    virtual ncnn::Layer* create_custom_layer(int index);
+
+    int custom_layer_index;
+
 public:
     // 0=fp32 1=fp16
     int storage_type;
@@ -157,10 +257,13 @@ public:
     int eliminate_flatten_after_innerproduct();
     int eliminate_reshape_before_binaryop();
 
+    int replace_reduction_with_global_pooling();
+    int replace_prelu_with_leaky_relu();
     int replace_convolution_with_innerproduct_after_global_pooling();
     int replace_convolution_with_innerproduct_after_innerproduct();
 
     int shape_inference();
+    int estimate_memory_footprint();
 
 public:
     int fprintf_param_int_array(int id, const ncnn::Mat& m, FILE* pp);
@@ -173,10 +276,55 @@ public:
 
 };
 
+NetOptimize::NetOptimize()
+{
+    custom_layer_index = 0;
+}
+
+int NetOptimize::custom_layer_to_index(const char* type)
+{
+    int index = Net::custom_layer_to_index(type);
+    if (index != -1)
+        return index;
+
+    fprintf(stderr, "custom_layer_to_index %s\n", type);
+
+    index = ncnn::LayerType::CustomBit | custom_layer_index;
+    custom_layer_index++;
+    return index;
+}
+
+ncnn::Layer* NetOptimize::create_custom_layer(const char* type)
+{
+    ncnn::Layer* layer = Net::create_custom_layer(type);
+    if (layer)
+        return layer;
+
+    fprintf(stderr, "create_custom_layer %s\n", type);
+
+    layer = new CustomLayer;
+    layer->type = type;
+    layer->typeindex = custom_layer_to_index(type);
+    return layer;
+}
+
+ncnn::Layer* NetOptimize::create_custom_layer(int index)
+{
+    ncnn::Layer* layer = Net::create_custom_layer(index);
+    if (layer)
+        return layer;
+
+    fprintf(stderr, "create_custom_layer %d\n", index);
+
+    layer = new CustomLayer;
+    layer->typeindex = index;
+    return layer;
+}
+
 int NetOptimize::fuse_batchnorm_scale()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "BatchNorm")
             continue;
@@ -184,7 +332,7 @@ int NetOptimize::fuse_batchnorm_scale()
         // BatchNorm - Scale
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "Scale")
@@ -237,7 +385,7 @@ int NetOptimize::fuse_batchnorm_scale()
 int NetOptimize::fuse_convolution_batchnorm()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Convolution")
             continue;
@@ -245,7 +393,7 @@ int NetOptimize::fuse_convolution_batchnorm()
         // Convolution - BatchNorm
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BatchNorm")
@@ -320,7 +468,7 @@ int NetOptimize::fuse_convolution_batchnorm()
 int NetOptimize::fuse_convolution_mul()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Convolution")
             continue;
@@ -328,7 +476,7 @@ int NetOptimize::fuse_convolution_mul()
         // Convolution - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -352,7 +500,7 @@ int NetOptimize::fuse_convolution_mul()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -409,7 +557,7 @@ int NetOptimize::fuse_convolution_mul()
 int NetOptimize::fuse_convolution_add()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Convolution")
             continue;
@@ -417,7 +565,7 @@ int NetOptimize::fuse_convolution_add()
         // Convolution - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -441,7 +589,7 @@ int NetOptimize::fuse_convolution_add()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -495,7 +643,7 @@ int NetOptimize::fuse_convolution_add()
 int NetOptimize::fuse_convolutiondepthwise_batchnorm()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "ConvolutionDepthWise")
             continue;
@@ -503,7 +651,7 @@ int NetOptimize::fuse_convolutiondepthwise_batchnorm()
         // ConvolutionDepthWise - BatchNorm
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BatchNorm")
@@ -578,7 +726,7 @@ int NetOptimize::fuse_convolutiondepthwise_batchnorm()
 int NetOptimize::fuse_convolutiondepthwise_mul()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "ConvolutionDepthWise")
             continue;
@@ -586,7 +734,7 @@ int NetOptimize::fuse_convolutiondepthwise_mul()
         // ConvolutionDepthWise - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -610,7 +758,7 @@ int NetOptimize::fuse_convolutiondepthwise_mul()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -667,7 +815,7 @@ int NetOptimize::fuse_convolutiondepthwise_mul()
 int NetOptimize::fuse_convolutiondepthwise_add()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "ConvolutionDepthWise")
             continue;
@@ -675,7 +823,7 @@ int NetOptimize::fuse_convolutiondepthwise_add()
         // ConvolutionDepthWise - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -699,7 +847,7 @@ int NetOptimize::fuse_convolutiondepthwise_add()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -753,7 +901,7 @@ int NetOptimize::fuse_convolutiondepthwise_add()
 int NetOptimize::fuse_deconvolution_batchnorm()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Deconvolution")
             continue;
@@ -761,7 +909,7 @@ int NetOptimize::fuse_deconvolution_batchnorm()
         // Deconvolution - BatchNorm
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BatchNorm")
@@ -836,7 +984,7 @@ int NetOptimize::fuse_deconvolution_batchnorm()
 int NetOptimize::fuse_deconvolution_mul()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Deconvolution")
             continue;
@@ -844,7 +992,7 @@ int NetOptimize::fuse_deconvolution_mul()
         // Deconvolution - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -868,7 +1016,7 @@ int NetOptimize::fuse_deconvolution_mul()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -925,7 +1073,7 @@ int NetOptimize::fuse_deconvolution_mul()
 int NetOptimize::fuse_deconvolution_add()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Deconvolution")
             continue;
@@ -933,7 +1081,7 @@ int NetOptimize::fuse_deconvolution_add()
         // Deconvolution - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -957,7 +1105,7 @@ int NetOptimize::fuse_deconvolution_add()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -1011,7 +1159,7 @@ int NetOptimize::fuse_deconvolution_add()
 int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "DeconvolutionDepthWise")
             continue;
@@ -1019,7 +1167,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
         // DeconvolutionDepthWise - BatchNorm
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BatchNorm")
@@ -1094,7 +1242,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
 int NetOptimize::fuse_innerproduct_batchnorm()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
             continue;
@@ -1102,7 +1250,7 @@ int NetOptimize::fuse_innerproduct_batchnorm()
         // InnerProduct - BatchNorm
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BatchNorm")
@@ -1177,7 +1325,7 @@ int NetOptimize::fuse_innerproduct_batchnorm()
 int NetOptimize::fuse_innerproduct_add()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
             continue;
@@ -1185,7 +1333,7 @@ int NetOptimize::fuse_innerproduct_add()
         // InnerProduct - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -1209,7 +1357,7 @@ int NetOptimize::fuse_innerproduct_add()
             continue;
 
         // MemoryData - ..... - BinaryOp
-        int k = 0;
+        size_t k = 0;
         for (; k < j; k++)
         {
             if (layers[k]->type != "MemoryData")
@@ -1263,7 +1411,7 @@ int NetOptimize::fuse_innerproduct_add()
 int NetOptimize::fuse_innerproduct_dropout()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
             continue;
@@ -1271,7 +1419,7 @@ int NetOptimize::fuse_innerproduct_dropout()
         // InnerProduct - Dropout
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "Dropout")
@@ -1331,7 +1479,7 @@ int NetOptimize::fuse_innerproduct_dropout()
 int NetOptimize::fuse_convolution_activation()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Convolution")
             continue;
@@ -1339,7 +1487,7 @@ int NetOptimize::fuse_convolution_activation()
         // Convolution - Activation
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "ReLU" && layers[j]->type != "Clip" && layers[j]->type != "Sigmoid" && layers[j]->type != "Mish")
@@ -1406,7 +1554,7 @@ int NetOptimize::fuse_convolution_activation()
 int NetOptimize::fuse_convolutiondepthwise_activation()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "ConvolutionDepthWise")
             continue;
@@ -1414,7 +1562,7 @@ int NetOptimize::fuse_convolutiondepthwise_activation()
         // ConvolutionDepthWise - Activation
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "ReLU" && layers[j]->type != "Clip" && layers[j]->type != "Sigmoid" && layers[j]->type != "Mish")
@@ -1481,7 +1629,7 @@ int NetOptimize::fuse_convolutiondepthwise_activation()
 int NetOptimize::fuse_deconvolution_activation()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Deconvolution")
             continue;
@@ -1489,7 +1637,7 @@ int NetOptimize::fuse_deconvolution_activation()
         // Deconvolution - Activation
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "ReLU" && layers[j]->type != "Clip" && layers[j]->type != "Sigmoid")
@@ -1552,7 +1700,7 @@ int NetOptimize::fuse_deconvolution_activation()
 int NetOptimize::fuse_deconvolutiondepthwise_activation()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "DeconvolutionDepthWise")
             continue;
@@ -1560,7 +1708,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_activation()
         // DeconvolutionDepthWise - Activation
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "ReLU" && layers[j]->type != "Clip" && layers[j]->type != "Sigmoid")
@@ -1623,7 +1771,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_activation()
 int NetOptimize::fuse_innerproduct_activation()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
             continue;
@@ -1631,7 +1779,7 @@ int NetOptimize::fuse_innerproduct_activation()
         // InnerProduct - Activation
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "ReLU" && layers[j]->type != "Clip" && layers[j]->type != "Sigmoid")
@@ -1694,7 +1842,7 @@ int NetOptimize::fuse_innerproduct_activation()
 int NetOptimize::fuse_memorydata_binaryop()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "MemoryData")
             continue;
@@ -1702,7 +1850,7 @@ int NetOptimize::fuse_memorydata_binaryop()
         // MemoryData - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -1769,7 +1917,7 @@ int NetOptimize::fuse_memorydata_binaryop()
         memorydata->type = "ncnnfused";
     }
 
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "MemoryData")
             continue;
@@ -1777,7 +1925,7 @@ int NetOptimize::fuse_memorydata_binaryop()
         // MemoryData - Split - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j0 = i + 1;
+        size_t j0 = i + 1;
         for (; j0 < layer_count; j0++)
         {
             if (layers[j0]->type != "Split")
@@ -1795,7 +1943,7 @@ int NetOptimize::fuse_memorydata_binaryop()
 
         int split_top_blob_index = -1;
 
-        int j1 = j0 + 1;
+        size_t j1 = j0 + 1;
         for (; j1 < layer_count; j1++)
         {
             if (layers[j1]->type != "BinaryOp")
@@ -1885,7 +2033,7 @@ int NetOptimize::fuse_memorydata_binaryop()
 int NetOptimize::fuse_binaryop_eltwise()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "BinaryOp")
             continue;
@@ -1905,7 +2053,7 @@ int NetOptimize::fuse_binaryop_eltwise()
         int bottom_blob_index_0 = binaryop->bottoms[0];
         int bottom_blob_index_1 = binaryop->bottoms[1];
 
-        int j0 = 0;
+        size_t j0 = 0;
         for (; j0 < i; j0++)
         {
             if (layers[j0]->type != "BinaryOp")
@@ -1921,7 +2069,7 @@ int NetOptimize::fuse_binaryop_eltwise()
                 break;
         }
 
-        int j1 = 0;
+        size_t j1 = 0;
         for (; j1 < i; j1++)
         {
             if (layers[j1]->type != "BinaryOp")
@@ -2002,7 +2150,7 @@ int NetOptimize::fuse_binaryop_eltwise()
 int NetOptimize::eliminate_dropout()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Dropout")
             continue;
@@ -2046,7 +2194,7 @@ int NetOptimize::eliminate_dropout()
 int NetOptimize::eliminate_pooling1x1()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Pooling")
             continue;
@@ -2071,7 +2219,7 @@ int NetOptimize::eliminate_pooling1x1()
             if (layers[j]->type == "ncnnfused")
                 continue;
 
-            for (int k = 0; k < layers[j]->tops.size(); k++)
+            for (size_t k = 0; k < layers[j]->tops.size(); k++)
             {
                 if (layers[j]->tops[k] == bottom_blob_index)
                 {
@@ -2103,7 +2251,7 @@ int NetOptimize::eliminate_pooling1x1()
 int NetOptimize::eliminate_noop()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Noop")
             continue;
@@ -2116,7 +2264,7 @@ int NetOptimize::eliminate_noop()
             fprintf(stderr, "eliminate_noop %s\n", noop->name.c_str());
 
             size_t top_blob_count = noop->tops.size();
-            for (int k = 0; k < top_blob_count; k++)
+            for (size_t k = 0; k < top_blob_count; k++)
             {
                 int top_blob_index_final = noop->tops[k];
                 blobs[top_blob_index_final].producer = -1;
@@ -2150,7 +2298,7 @@ int NetOptimize::eliminate_noop()
         fprintf(stderr, "eliminate_noop %s %s\n", any->name.c_str(), noop->name.c_str());
 
         size_t top_blob_count = std::min(noop->tops.size(), any->tops.size());
-        for (int k = 0; k < top_blob_count; k++)
+        for (size_t k = 0; k < top_blob_count; k++)
         {
             int top_blob_index_final = noop->tops[k];
             any->tops[k] = top_blob_index_final;
@@ -2165,7 +2313,7 @@ int NetOptimize::eliminate_noop()
 int NetOptimize::eliminate_orphaned_memorydata()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "MemoryData")
             continue;
@@ -2173,14 +2321,14 @@ int NetOptimize::eliminate_orphaned_memorydata()
         // MemoryData - X
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type == "ncnnfused")
                 continue;
 
             bool orphaned = true;
-            for (int k = 0; k < layers[j]->bottoms.size(); k++)
+            for (size_t k = 0; k < layers[j]->bottoms.size(); k++)
             {
                 if (layers[j]->bottoms[k] == top_blob_index)
                 {
@@ -2208,7 +2356,7 @@ int NetOptimize::eliminate_orphaned_memorydata()
 int NetOptimize::eliminate_reshape_after_global_pooling()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Pooling")
             continue;
@@ -2220,7 +2368,7 @@ int NetOptimize::eliminate_reshape_after_global_pooling()
         // Pooling - Reshape
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "Reshape")
@@ -2254,7 +2402,7 @@ int NetOptimize::eliminate_reshape_after_global_pooling()
 int NetOptimize::eliminate_flatten_after_global_pooling()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Pooling")
             continue;
@@ -2266,7 +2414,7 @@ int NetOptimize::eliminate_flatten_after_global_pooling()
         // Pooling - Flatten
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "Flatten")
@@ -2298,7 +2446,7 @@ int NetOptimize::eliminate_flatten_after_global_pooling()
 int NetOptimize::eliminate_flatten_after_innerproduct()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "InnerProduct")
             continue;
@@ -2306,7 +2454,7 @@ int NetOptimize::eliminate_flatten_after_innerproduct()
         // InnerProduct - Flatten
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "Flatten")
@@ -2339,7 +2487,7 @@ int NetOptimize::eliminate_flatten_after_innerproduct()
 int NetOptimize::eliminate_reshape_before_binaryop()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Reshape")
             continue;
@@ -2351,7 +2499,7 @@ int NetOptimize::eliminate_reshape_before_binaryop()
         // Reshape - BinaryOp
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "BinaryOp")
@@ -2384,10 +2532,120 @@ int NetOptimize::eliminate_reshape_before_binaryop()
     return 0;
 }
 
+int NetOptimize::replace_reduction_with_global_pooling()
+{
+    const size_t layer_count = layers.size();
+    for (size_t i = 0; i < layer_count; i++)
+    {
+        if (layers[i]->type != "Reduction")
+            continue;
+
+        ncnn::Reduction* reduction1 = (ncnn::Reduction*)layers[i];
+        if (reduction1->operation != 3 || reduction1->reduce_all != 0 || reduction1->coeff != 1.f)
+            continue;
+
+        if (reduction1->axes.w != 1)
+            continue;
+
+        const int* axes_ptr = reduction1->axes;
+        if (axes_ptr[0] != 2 && axes_ptr[0] != 3)
+            continue;
+
+        // Reduction(2/3) - Reduction(2)
+        int top_blob_index = layers[i]->tops[0];
+
+        size_t j = i + 1;
+        for (; j < layer_count; j++)
+        {
+            if (layers[j]->type != "Reduction")
+                continue;
+
+            if (layers[j]->bottoms.size() != 1)
+                continue;
+
+            if (layers[j]->bottoms[0] == top_blob_index)
+                break;
+        }
+
+        if (j == layer_count)
+            continue;
+
+        ncnn::Reduction* reduction2 = (ncnn::Reduction*)layers[j];
+        if (reduction2->operation != 3 || reduction2->reduce_all != 0 || reduction2->coeff != 1.f)
+            continue;
+
+        if (reduction2->axes.w != 1)
+            continue;
+
+        const int* axes2_ptr = reduction2->axes;
+        if (axes2_ptr[0] != 2)
+            continue;
+
+        fprintf(stderr, "replace_reduction_with_global_pooling %s %s\n", reduction1->name.c_str(), reduction2->name.c_str());
+
+        ncnn::Pooling* pooling = (ncnn::Pooling*)ncnn::create_layer("Pooling");
+
+        pooling->type = "Pooling";
+        pooling->name = reduction2->name;
+        pooling->bottoms = reduction2->bottoms;
+        pooling->tops = reduction2->tops;
+
+        ncnn::ParamDict pd;
+        pooling->load_param(pd);
+
+        pooling->pooling_type = 1;
+        pooling->global_pooling = 1;
+
+        layers[j] = pooling;
+        delete reduction2;
+
+        int bottom_blob_index_final = reduction1->bottoms[0];
+        pooling->bottoms[0] = bottom_blob_index_final;
+        blobs[bottom_blob_index_final].consumers.clear();
+        blobs[bottom_blob_index_final].consumers.push_back(j);
+        reduction1->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
+int NetOptimize::replace_prelu_with_leaky_relu()
+{
+    const size_t layer_count = layers.size();
+    for (size_t i = 0; i < layer_count; i++)
+    {
+        if (layers[i]->type != "PReLU")
+            continue;
+
+        ncnn::PReLU* prelu = (ncnn::PReLU*)layers[i];
+        if (prelu->num_slope != 1)
+            continue;
+
+        fprintf(stderr, "replace_prelu_with_leaky_relu %s\n", prelu->name.c_str());
+
+        ncnn::ReLU* relu = (ncnn::ReLU*)ncnn::create_layer("ReLU");
+
+        relu->type = "ReLU";
+        relu->name = prelu->name;
+        relu->bottoms = prelu->bottoms;
+        relu->tops = prelu->tops;
+
+        ncnn::ParamDict pd;
+        relu->load_param(pd);
+
+        relu->slope = prelu->slope_data[0];
+
+        layers[i] = relu;
+        delete prelu;
+    }
+
+    return 0;
+}
+
 int NetOptimize::replace_convolution_with_innerproduct_after_global_pooling()
 {
     const size_t layer_count = layers.size();
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         if (layers[i]->type != "Pooling")
             continue;
@@ -2399,7 +2657,7 @@ int NetOptimize::replace_convolution_with_innerproduct_after_global_pooling()
         // Pooling - Convolution
         int top_blob_index = layers[i]->tops[0];
 
-        int j = i + 1;
+        size_t j = i + 1;
         for (; j < layer_count; j++)
         {
             if (layers[j]->type != "Convolution")
@@ -2456,7 +2714,7 @@ int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
     {
         bool replaced = false;
 
-        for (int i = 0; i < layer_count; i++)
+        for (size_t i = 0; i < layer_count; i++)
         {
             if (layers[i]->type != "InnerProduct")
                 continue;
@@ -2464,7 +2722,7 @@ int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
             // InnerProduct - Convolution
             int top_blob_index = layers[i]->tops[0];
 
-            int j = i + 1;
+            size_t j = i + 1;
             for (; j < layer_count; j++)
             {
                 if (layers[j]->type != "Convolution")
@@ -2523,16 +2781,17 @@ int NetOptimize::replace_convolution_with_innerproduct_after_innerproduct()
 
 int NetOptimize::shape_inference()
 {
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+    if (custom_layer_index)
+    {
+        fprintf(stderr, "model has %d custom layer, shape_inference aborted\n", custom_layer_index);
+        return -1;
+    }
+
     const size_t layer_count = layers.size();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     const size_t blob_count = blobs.size();
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     ncnn::Extractor ex = create_extractor();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // prepare Input blobs
     for (size_t i = 0; i < layer_count; i++)
     {
@@ -2540,75 +2799,58 @@ int NetOptimize::shape_inference()
         if (layer->type == "ncnnfused")
             continue;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         if (layer->type != "Input")
             continue;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ncnn::Input* input = (ncnn::Input*)layer;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         int w = input->w;
         int h = input->h;
         int c = input->c;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         int dims = 0;
         if (w == 0 && h == 0 && c == 0) dims = 0;
         if (w != 0 && h == 0 && c == 0) dims = 1;
         if (w != 0 && h != 0 && c == 0) dims = 2;
         if (w != 0 && h != 0 && c != 0) dims = 3;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         if (dims == 0)
         {
             fprintf(stderr, "Input layer %s without shape info, shape_inference aborted\n", layer->name.c_str());
             return -1;
         }
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ncnn::Mat m;
         if (dims == 1) m.create(w);
         if (dims == 2) m.create(w, h);
         if (dims == 3) m.create(w, h, c);
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
         ex.input(layer->tops[0], m);
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     }
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     // prepare blobs with predefined shape
     for (size_t i = 0; i < blob_count; i++)
     {
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
-        const ncnn::Blob blob = blobs[i];
+        const ncnn::Blob& blob = blobs[i];
 
         int dims = blob.shape.dims;
         int w = blob.shape.w;
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         int h = blob.shape.h;
         int c = blob.shape.c;
 
         if (dims == 0)
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             continue;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ncnn::Mat m;
         if (dims == 1) m.create(w);
         if (dims == 2) m.create(w, h);
         if (dims == 3) m.create(w, h, c);
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         ex.input(int(i), m);
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     }
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     fprintf(stderr, "shape_inference\n");
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // resolve all layer output blob shape
     for (size_t i = 0; i < layer_count; i++)
     {
@@ -2620,16 +2862,13 @@ int NetOptimize::shape_inference()
         {
             int top_blob_index = layer->tops[j];
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             ncnn::Mat m;
             ex.extract(top_blob_index, m);
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             blobs[top_blob_index].shape = m;
         }
     }
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     // assign all layer blob shape
     for (size_t i = 0; i < layer_count; i++)
     {
@@ -2637,29 +2876,102 @@ int NetOptimize::shape_inference()
         if (layer->type == "ncnnfused")
             continue;
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         layer->bottom_shapes.resize(layer->bottoms.size());
         for (size_t j = 0; j < layer->bottoms.size(); j++)
         {
             int bottom_blob_index = layer->bottoms[j];
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
             layer->bottom_shapes[j] = blobs[bottom_blob_index].shape;
         }
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
         layer->top_shapes.resize(layer->tops.size());
         for (size_t j = 0; j < layer->tops.size(); j++)
         {
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
             int top_blob_index = layer->tops[j];
 
             layer->top_shapes[j] = blobs[top_blob_index].shape;
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
             //             fprintf(stderr, "%d %4d %4d %4d | %2d %s\n", blobs[top_blob_index].shape.dims, blobs[top_blob_index].shape.w, blobs[top_blob_index].shape.h, blobs[top_blob_index].shape.c, top_blob_index, blobs[top_blob_index].name.c_str());
         }
     }
+
+    return 0;
+}
+
+int NetOptimize::estimate_memory_footprint()
+{
+    if (custom_layer_index)
+    {
+        fprintf(stderr, "model has %d custom layer, estimate_memory_footprint aborted\n", custom_layer_index);
+        return -1;
+    }
+
+    const size_t layer_count = layers.size();
+    const size_t blob_count = blobs.size();
+
+    MemoryFootprintAllocator allocator;
+
+    ncnn::Extractor ex = create_extractor();
+
+    ex.set_blob_allocator(&allocator);
+    ex.set_workspace_allocator(&allocator);
+
+    // prepare Input blobs
+    for (size_t i = 0; i < layer_count; i++)
+    {
+        const ncnn::Layer* layer = layers[i];
+        if (layer->type == "ncnnfused")
+            continue;
+
+        if (layer->type != "Input")
+            continue;
+
+        ncnn::Input* input = (ncnn::Input*)layer;
+
+        int w = input->w;
+        int h = input->h;
+        int c = input->c;
+
+        int dims = 0;
+        if (w == 0 && h == 0 && c == 0) dims = 0;
+        if (w != 0 && h == 0 && c == 0) dims = 1;
+        if (w != 0 && h != 0 && c == 0) dims = 2;
+        if (w != 0 && h != 0 && c != 0) dims = 3;
+
+        if (dims == 0)
+        {
+            fprintf(stderr, "Input layer %s without shape info, estimate_memory_footprint aborted\n", layer->name.c_str());
+            return -1;
+        }
+
+        ncnn::Mat m;
+        if (dims == 1) m.create(w, 4u, &allocator);
+        if (dims == 2) m.create(w, h, 4u, &allocator);
+        if (dims == 3) m.create(w, h, c, 4u, &allocator);
+
+        ex.input(layer->tops[0], m);
+
+        fprintf(stderr, "input = %s\n", blobs[layer->tops[0]].name.c_str());
+    }
+
+    // find output blobs and do inference
+    std::vector<ncnn::Mat> outputs;
+    for (size_t i = 0; i < blob_count; i++)
+    {
+        const ncnn::Blob& blob = blobs[i];
+
+        if (!blob.consumers.empty())
+            continue;
+
+        // treat blob without any consumers as output
+        ncnn::Mat m;
+        ex.extract(int(i), m);
+        outputs.push_back(m);
+
+        fprintf(stderr, "extract = %s\n", blob.name.c_str());
+    }
+
+    fprintf(stderr, "estimated memory footprint = %.2f KB = %.2f MB\n", allocator.memory_footprint / 1024.f, allocator.memory_footprint / 1024.f / 1024.f);
 
     return 0;
 }
@@ -2753,7 +3065,7 @@ int NetOptimize::save(FILE *pp, FILE *bp)
 
     int layer_count_fused = 0;
     std::set<std::string> blob_names;
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         const ncnn::Layer* layer = layers[i];
         if (layer->type == "ncnnfused")
@@ -2762,14 +3074,14 @@ int NetOptimize::save(FILE *pp, FILE *bp)
         layer_count_fused++;
 
         size_t bottom_count = layer->bottoms.size();
-        for (int j = 0; j < bottom_count; j++)
+        for (size_t j = 0; j < bottom_count; j++)
         {
             int bottom_blob_index = layer->bottoms[j];
             blob_names.insert(blobs[bottom_blob_index].name);
         }
 
         size_t top_count = layer->tops.size();
-        for (int j = 0; j < top_count; j++)
+        for (size_t j = 0; j < top_count; j++)
         {
             int top_blob_index = layer->tops[j];
             blob_names.insert(blobs[top_blob_index].name);
@@ -2780,7 +3092,7 @@ int NetOptimize::save(FILE *pp, FILE *bp)
 
     fprintf(pp, "%d %zd\n", layer_count_fused, blob_count_fused);
 
-    for (int i = 0; i < layer_count; i++)
+    for (size_t i = 0; i < layer_count; i++)
     {
         const ncnn::Layer* layer = layers[i];
         if (layer->type == "ncnnfused")
@@ -2791,12 +3103,12 @@ int NetOptimize::save(FILE *pp, FILE *bp)
 
         fprintf(pp, "%-24s %-24s %zd %zd", layer->type.c_str(), layer->name.c_str(), bottom_count, top_count);
 
-        for (int j = 0; j < bottom_count; j++)
+        for (size_t j = 0; j < bottom_count; j++)
         {
             int bottom_blob_index = layer->bottoms[j];
             fprintf(pp, " %s", blobs[bottom_blob_index].name.c_str());
         }
-        for (int j = 0; j < top_count; j++)
+        for (size_t j = 0; j < top_count; j++)
         {
             int top_blob_index = layer->tops[j];
             fprintf(pp, " %s", blobs[top_blob_index].name.c_str());
@@ -2804,7 +3116,7 @@ int NetOptimize::save(FILE *pp, FILE *bp)
 
         // write shape hints
         bool shape_ready = true;
-        for (int j = 0; j < top_count; j++)
+        for (size_t j = 0; j < top_count; j++)
         {
             int top_blob_index = layer->tops[j];
 
@@ -2818,7 +3130,7 @@ int NetOptimize::save(FILE *pp, FILE *bp)
         if (shape_ready)
         {
             fprintf(pp, " -23330=%zd", top_count * 4);
-            for (int j = 0; j < top_count; j++)
+            for (size_t j = 0; j < top_count; j++)
             {
                 int top_blob_index = layer->tops[j];
 
@@ -2829,6 +3141,16 @@ int NetOptimize::save(FILE *pp, FILE *bp)
 
                 fprintf(pp, ",%d,%d,%d,%d", dims, w, h, c);
             }
+        }
+
+        // custom op
+        if (layer->typeindex & ncnn::LayerType::CustomBit)
+        {
+            ((CustomLayer*)layer)->write_param(pp);
+
+            fprintf(pp, "\n");
+
+            continue;
         }
 
         ncnn::Layer* layer_default = ncnn::create_layer(layer->typeindex);
@@ -3697,7 +4019,6 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(void **inparam, void **inbin, 
     int err1 = optimizer.load_param_mem(reinterpret_cast<const char *>(*inparam));
     free(*inparam);
     *inparam = nullptr;
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     std::cout << err1 << std::endl;
     if (err1) {
         return tl::make_unexpected("load param failed in ncnnoptimize");
@@ -3714,11 +4035,9 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(void **inparam, void **inbin, 
     if (!err2) {
         return tl::make_unexpected("load param failed in ncnnoptimize");
     }
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     std::cout << err2 << std::endl;
 
     optimizer.fuse_batchnorm_scale();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_convolution_batchnorm();
     optimizer.fuse_convolution_mul();
     optimizer.fuse_convolution_add();
@@ -3730,65 +4049,48 @@ tl::expected<NcnnModel, std::string> ncnnoptimize(void **inparam, void **inbin, 
     optimizer.fuse_deconvolution_add();
     optimizer.fuse_deconvolutiondepthwise_batchnorm();
     optimizer.fuse_innerproduct_batchnorm();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_innerproduct_add();
     optimizer.fuse_innerproduct_dropout();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+
+    optimizer.replace_reduction_with_global_pooling();
+    optimizer.replace_prelu_with_leaky_relu();
+
     optimizer.fuse_convolution_activation();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_convolutiondepthwise_activation();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_deconvolution_activation();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_deconvolutiondepthwise_activation();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.fuse_innerproduct_activation();
     optimizer.fuse_memorydata_binaryop();
     optimizer.fuse_binaryop_eltwise();
 
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_dropout();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_pooling1x1();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_noop();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_flatten_after_global_pooling();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_reshape_after_global_pooling();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_reshape_before_binaryop();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.replace_convolution_with_innerproduct_after_global_pooling();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.replace_convolution_with_innerproduct_after_innerproduct();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.eliminate_flatten_after_innerproduct();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     optimizer.eliminate_orphaned_memorydata();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.shape_inference();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
+    // optimizer.estimate_memory_footprint();
 
     // char *pp_ptr, *bp_ptr;
     // size_t pp_size, bp_size;
     FakeFile pp, bp;
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     optimizer.save(pp, bp);
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     // std::string outparam(pp_ptr, pp_size);
     // std::string outbin(bp_ptr, bp_size);
     std::string error_str = stderr.CloseAndGetStr();
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
     std::cout << "error: " << error_str << std::endl;
     // replace newline to html <br/>
     error_str = ReplaceAll(error_str, "\n", "<br/>");
-    std::cout << __FILE__ << " " <<  __LINE__ << std::endl;
 
     return std::make_tuple(pp.CloseAndGetBuf(),
             bp.CloseAndGetBuf(),
