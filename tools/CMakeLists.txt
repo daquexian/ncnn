@@ -31,4 +31,5 @@ add_executable(ncnnmerge ncnnmerge.cpp)
 # add all tools to a virtual project group
 set_property(TARGET ncnn2mem PROPERTY FOLDER "tools")
 set_property(TARGET ncnnoptimize PROPERTY FOLDER "tools")
+set_target_properties(ncnnoptimize PROPERTIES LINK_FLAGS "-s FORCE_FILESYSTEM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s 'EXPORT_NAME=\"create_ncnnoptimize\"' -s 'EXTRA_EXPORTED_RUNTIME_METHODS=[FS,ccall,cwrap,callMain]' -s EXPORTED_FUNCTIONS=[_main]")
 set_property(TARGET ncnnmerge PROPERTY FOLDER "tools")

@@ -12,6 +12,7 @@ if(PROTOBUF_FOUND)
 
     # add all onnx2ncnn tool to a virtual project group
     set_property(TARGET onnx2ncnn PROPERTY FOLDER "tools/converter")
+    set_target_properties(onnx2ncnn PROPERTIES LINK_FLAGS "-s FORCE_FILESYSTEM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s 'EXPORT_NAME=\"create_onnx2ncnn\"' -s 'EXTRA_EXPORTED_RUNTIME_METHODS=[FS,ccall,cwrap,callMain]' -s EXPORTED_FUNCTIONS=[_main]")
 else()
     message(WARNING "Protobuf not found, onnx model convert tool won't be built")
 endif()
