@@ -59,3 +59,4 @@ target_link_libraries(mlir2ncnn
     MLIRStandard
     MLIRTransforms
 )
+set_target_properties(mlir2ncnn PROPERTIES LINK_FLAGS "-s FORCE_FILESYSTEM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s 'EXPORT_NAME=\"create_mlir2ncnn\"' -s 'EXTRA_EXPORTED_RUNTIME_METHODS=[FS,ccall,cwrap,callMain]' -s EXPORTED_FUNCTIONS=[_main]")
